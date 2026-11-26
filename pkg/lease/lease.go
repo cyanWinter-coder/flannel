@@ -174,7 +174,12 @@ func (lw *LeaseWatcher) add(lease *Lease) Event {
 	return Event{EventAdded, lw.Leases[len(lw.Leases)-1]}
 }
 
-// remove updates lw.Leases, removing the passed lease
+// remove updates lw.Leases, removing the passed lease. It is idempotent: when
+// the lease is already absent (e.g. a deletion redelivered after a watch
+// relist, or an add/remove pair processed out of the informer's initial
+// window), it still returns an EventRemoved so the caller can tear down any
+// route that matches the subnet, and logs at info level rather than raising a
+// misleading error for an expected condition.
 func (lw *LeaseWatcher) remove(lease *Lease) Event {
 	for i, l := range lw.Leases {
 		if sameSubnet(l.EnableIPv4, l.EnableIPv6, l, *lease) {
@@ -183,7 +188,7 @@ func (lw *LeaseWatcher) remove(lease *Lease) Event {
 		}
 	}
 
-	log.Errorf("Removed subnet (%s) and ipv6 subnet (%s) were not found", lease.Subnet, lease.IPv6Subnet)
+	log.Infof("Removed subnet (%s) and ipv6 subnet (%s) were not tracked; treating repeated removal as a no-op", lease.Subnet, lease.IPv6Subnet)
 	return Event{EventRemoved, *lease}
 }
 

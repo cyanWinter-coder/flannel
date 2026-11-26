@@ -29,7 +29,6 @@ import (
 	"github.com/flannel-io/flannel/pkg/ip"
 	"github.com/flannel-io/flannel/pkg/lease"
 	"github.com/flannel-io/flannel/pkg/subnet"
-	"golang.org/x/sync/semaphore"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -50,6 +49,16 @@ var (
 const (
 	resyncPeriod              = 5 * time.Minute
 	nodeControllerSyncTimeout = 10 * time.Minute
+
+	// patchMaxAttempts bounds the retries when writing flannel annotations
+	// (the node "configuration") back to the API server.
+	patchMaxAttempts = 5
+	// patchInitialBackoff / patchMaxBackoff drive exponential backoff between
+	// patch attempts.
+	patchInitialBackoff = 500 * time.Millisecond
+	patchMaxBackoff     = 15 * time.Second
+	// patchOverallTimeout caps the whole retry loop regardless of attempts.
+	patchOverallTimeout = 2 * time.Minute
 )
 
 type subnetFileInfo struct {
@@ -61,21 +70,45 @@ type subnetFileInfo struct {
 }
 
 type kubeSubnetManager struct {
-	enableIPv4                bool
-	enableIPv6                bool
-	annotations               annotations
-	annotationPrefix          string
-	client                    clientset.Interface
-	nodeName                  string
-	nodeStore                 cache.Store
-	nodeController            cache.Controller
+	enableIPv4       bool
+	enableIPv6       bool
+	annotations      annotations
+	annotationPrefix string
+	client           clientset.Interface
+	nodeName         string
+	nodeStore        cache.Store
+	nodeController   cache.Controller
+	// listerWatcherFactory builds the node ListerWatcher; overridable in
+	// tests so the informer can run against clients (e.g. fake clientset)
+	// that do not provide a working RESTClient.
+	listerWatcherFactory      func() cache.ListerWatcher
 	subnetConf                *subnet.Config
 	events                    chan lease.Event
-	asyncSendSemaphore        *semaphore.Weighted
+	eventQueue                *nodeEventQueue
 	clusterCIDRController     cache.Controller
 	setNodeNetworkUnavailable bool
 	disableNodeInformer       bool
 	snFileInfo                *subnetFileInfo
+
+	// patchStats tracks node annotation write failures so that retry counts
+	// and reasons are observable via logs and the NodePatchStats accessor.
+	patchStatsMu sync.Mutex
+	patchStats   map[string]*nodePatchStats
+
+	// patchBackoff / patchTimeout drive retries when writing flannel
+	// annotations. They default to the package-level constants but are kept
+	// as fields so tests can shrink the delays.
+	patchBackoff wait.Backoff
+	patchTimeout time.Duration
+}
+
+// nodePatchStats accumulates node configuration (annotation patch) write
+// attempts for one node. Counters are safe to read while the manager runs.
+type nodePatchStats struct {
+	Attempts    int
+	Failures    int
+	LastError   string
+	LastAttempt time.Time
 }
 
 func NewSubnetManager(ctx context.Context, apiUrl, kubeconfig, prefix, netConfPath string, setNodeNetworkUnavailable bool) (subnet.Manager, error) {
@@ -169,6 +202,13 @@ func NewSubnetManager(ctx context.Context, apiUrl, kubeconfig, prefix, netConfPa
 // newKubeSubnetManager fills the kubeSubnetManager. The most important part is the controller which will
 // watch for kubernetes node updates
 func newKubeSubnetManager(ctx context.Context, c clientset.Interface, sc *subnet.Config, nodeName, prefix string) (*kubeSubnetManager, error) {
+	return newKubeSubnetManagerWithListerWatcher(ctx, c, sc, nodeName, prefix, nil)
+}
+
+// newKubeSubnetManagerWithListerWatcher is the same as newKubeSubnetManager but
+// allows injecting a custom node ListerWatcher (used by tests that run the
+// informer against a fake clientset, whose RESTClient is nil).
+func newKubeSubnetManagerWithListerWatcher(ctx context.Context, c clientset.Interface, sc *subnet.Config, nodeName, prefix string, lwFactory func() cache.ListerWatcher) (*kubeSubnetManager, error) {
 	var err error
 	var ksm kubeSubnetManager
 	ksm.annotationPrefix = prefix
@@ -180,6 +220,7 @@ func newKubeSubnetManager(ctx context.Context, c clientset.Interface, sc *subnet
 	ksm.enableIPv6 = sc.EnableIPv6
 	ksm.client = c
 	ksm.nodeName = nodeName
+	ksm.listerWatcherFactory = lwFactory
 	ksm.subnetConf = sc
 	scale := 5000
 	scaleStr := os.Getenv("EVENT_QUEUE_DEPTH")
@@ -193,18 +234,23 @@ func newKubeSubnetManager(ctx context.Context, c clientset.Interface, sc *subnet
 		}
 	}
 	ksm.events = make(chan lease.Event, scale)
-	ksm.asyncSendSemaphore = semaphore.NewWeighted(100)
+	ksm.eventQueue = newNodeEventQueue(ksm.events)
+	ksm.patchStats = make(map[string]*nodePatchStats)
+	ksm.patchBackoff = wait.Backoff{
+		Duration: patchInitialBackoff,
+		Factor:   2.0,
+		Jitter:   0.1,
+		Steps:    patchMaxAttempts,
+		Cap:      patchMaxBackoff,
+	}
+	ksm.patchTimeout = patchOverallTimeout
 	// when backend type is alloc, someone else (e.g. cloud-controller-managers) is taking care of the routing, thus we do not need informer
 	// See https://github.com/flannel-io/flannel/issues/1617
 	if sc.BackendType == "alloc" {
 		ksm.disableNodeInformer = true
 	}
 	if !ksm.disableNodeInformer {
-		listerWatcher := cache.NewListWatchFromClient(
-			ksm.client.CoreV1().RESTClient(),
-			"nodes",
-			"",
-			fields.Everything())
+		listerWatcher := newLoggingListWatch(ksm.nodeListerWatcher())
 
 		handler := cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
@@ -214,22 +260,23 @@ func newKubeSubnetManager(ctx context.Context, c clientset.Interface, sc *subnet
 				ksm.handleUpdateLeaseEvent(ctx, oldObj, newObj)
 			},
 			DeleteFunc: func(obj interface{}) {
-				_, isNode := obj.(*v1.Node)
-				// We can get DeletedFinalStateUnknown instead of *api.Node here and we need to handle that correctly.
-				if !isNode {
+				// We can get DeletedFinalStateUnknown instead of *v1.Node here
+				// when the watch missed the actual deletion; unwrap it so the
+				// subnet can still be released from the last known state.
+				node, ok := obj.(*v1.Node)
+				if !ok {
 					deletedState, ok := obj.(cache.DeletedFinalStateUnknown)
 					if !ok {
-						log.Infof("Error received unexpected object: %v", obj)
+						log.Errorf("Error received unexpected object: %v", obj)
 						return
 					}
-					node, ok := deletedState.Obj.(*v1.Node)
+					node, ok = deletedState.Obj.(*v1.Node)
 					if !ok {
-						log.Infof("Error deletedFinalStateUnknown contained non-Node object: %v", deletedState.Obj)
+						log.Errorf("Error deletedFinalStateUnknown contained non-Node object: %v", deletedState.Obj)
 						return
 					}
-					obj = node
 				}
-				ksm.handleAddLeaseEvent(ctx, lease.EventRemoved, obj)
+				ksm.handleDeleteLeaseEvent(ctx, node)
 			},
 		}
 		store, controller := cache.NewInformerWithOptions(cache.InformerOptions{
@@ -247,55 +294,33 @@ func newKubeSubnetManager(ctx context.Context, c clientset.Interface, sc *subnet
 	return &ksm, nil
 }
 
+// nodeListerWatcher returns the ListerWatcher backing the node informer.
+// Production uses the RESTClient-backed list/watch; tests can inject a factory
+// built on the typed client (which works with fake clientsets).
+func (ksm *kubeSubnetManager) nodeListerWatcher() cache.ListerWatcher {
+	if ksm.listerWatcherFactory != nil {
+		return ksm.listerWatcherFactory()
+	}
+	return cache.NewListWatchFromClient(
+		ksm.client.CoreV1().RESTClient(),
+		"nodes",
+		"",
+		fields.Everything())
+}
+
+// enqueueLeaseEvent hands an event to the per-node ordered queue. The queue
+// guarantees serialization for the node named in the event while different
+// nodes proceed concurrently, and applies backpressure instead of dropping or
+// reordering events when the downstream channel is saturated.
 func (ksm *kubeSubnetManager) enqueueLeaseEvent(ctx context.Context, evt lease.Event, nodeName string) {
-	// Try to send immediately
-	select {
-	case ksm.events <- evt:
-		return
-	default:
-		log.Infof("Channel buffer full, add event asynchronously")
-	}
-
-	// Instead of select with default, *block* until a slot is free
-	// Use a context with no timeout to block until a slot is available
-	if err := ksm.asyncSendSemaphore.Acquire(ctx, 1); err != nil {
-		log.Errorf("error in acquiring semaphore for async event send, dropping event: %v", err)
-		return
-	}
-
-	go func() {
-		defer func() { ksm.asyncSendSemaphore.Release(1) }() // release slot when done
-
-		backoff := 100 * time.Millisecond
-		maxBackoff := 5 * time.Second
-
-		for {
-
-			ticker := time.NewTicker(backoff)
-			select {
-			case <-ctx.Done():
-				log.Errorf("Context cancelled while retrying lease event for node %q", nodeName)
-				ticker.Stop()
-				return
-			case ksm.events <- evt:
-				log.Infof("Async requeued lease event for node %q", nodeName)
-				ticker.Stop()
-				return
-			default:
-				// events channel still full, retry with exp backoff
-				ticker.Stop()
-				backoff *= 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
-			}
-		}
-	}()
+	ksm.eventQueue.enqueue(ctx, nodeName, evt)
 }
 
 func (ksm *kubeSubnetManager) handleAddLeaseEvent(ctx context.Context, et lease.EventType, obj interface{}) {
 	n := obj.(*v1.Node)
 	if s, ok := n.Annotations[ksm.annotations.SubnetKubeManaged]; !ok || s != "true" {
+		// Nodes that are not flannel-managed yet carry no subnet lease; when
+		// they become managed handleUpdateLeaseEvent will emit the first event.
 		return
 	}
 
@@ -304,18 +329,51 @@ func (ksm *kubeSubnetManager) handleAddLeaseEvent(ctx context.Context, et lease.
 		log.Infof("Error turning node %q to lease: %v", n.Name, err)
 		return
 	}
+	log.V(2).Infof("Node %q lease event %v for subnet %s", n.Name, et, l.Subnet)
 	ksm.enqueueLeaseEvent(ctx, lease.Event{Type: et, Lease: l}, n.Name)
 }
 
-// handleUpdateLeaseEvent verifies if anything relevant changed in the node object: either
-// ksm.annotations.BackendData, ksm.annotations.BackendType or ksm.annotations.BackendPublicIP
-func (ksm *kubeSubnetManager) handleUpdateLeaseEvent(ctx context.Context, oldObj, newObj interface{}) {
-	o := oldObj.(*v1.Node)
-	n := newObj.(*v1.Node)
+// handleDeleteLeaseEvent releases the subnet of a removed node. The informer
+// may redeliver the deletion after a relist or as a DeletedFinalStateUnknown
+// tombstone, and downstream LeaseWatcher removal is already idempotent; keep
+// the conversion failures here non-fatal and log at info level so repeated
+// deletions do not generate misleading error noise.
+func (ksm *kubeSubnetManager) handleDeleteLeaseEvent(ctx context.Context, n *v1.Node) {
 	if s, ok := n.Annotations[ksm.annotations.SubnetKubeManaged]; !ok || s != "true" {
 		return
 	}
+
+	l, err := ksm.nodeToLease(*n)
+	if err != nil {
+		log.Infof("Error turning deleted node %q to lease: %v", n.Name, err)
+		return
+	}
+	log.Infof("Node %q deleted, releasing subnet %s", n.Name, l.Subnet)
+	ksm.enqueueLeaseEvent(ctx, lease.Event{Type: lease.EventRemoved, Lease: l}, n.Name)
+}
+
+// handleUpdateLeaseEvent verifies if anything relevant changed in the node object: either
+// ksm.annotations.BackendData, ksm.annotations.BackendType or ksm.annotations.BackendPublicIP,
+// or the flannel-managed marker flipping to "true" for a newly registered node.
+func (ksm *kubeSubnetManager) handleUpdateLeaseEvent(ctx context.Context, oldObj, newObj interface{}) {
+	o := oldObj.(*v1.Node)
+	n := newObj.(*v1.Node)
+
+	oldManaged := o.Annotations[ksm.annotations.SubnetKubeManaged] == "true"
+	newManaged := n.Annotations[ksm.annotations.SubnetKubeManaged] == "true"
+	if !newManaged {
+		return
+	}
+
 	var changed = false
+	// The node just became flannel-managed: its initial lease (including the
+	// PodCIDR assigned by the controller) must be emitted even if no backend
+	// annotation differs, otherwise the subnet is invisible until the next
+	// periodic resync (up to resyncPeriod, minutes later on large clusters).
+	if !oldManaged {
+		changed = true
+	}
+
 	if ksm.enableIPv4 && (o.Annotations[ksm.annotations.BackendData] != n.Annotations[ksm.annotations.BackendData] ||
 		o.Annotations[ksm.annotations.BackendType] != n.Annotations[ksm.annotations.BackendType] ||
 		o.Annotations[ksm.annotations.BackendPublicIP] != n.Annotations[ksm.annotations.BackendPublicIP]) {
@@ -338,6 +396,93 @@ func (ksm *kubeSubnetManager) handleUpdateLeaseEvent(ctx context.Context, oldObj
 		return
 	}
 	ksm.enqueueLeaseEvent(ctx, lease.Event{Type: lease.EventAdded, Lease: l}, n.Name)
+}
+
+// recordPatchAttempt updates the per-node counters of node configuration
+// writes. A nil error counts as a successful attempt only; every failure
+// reason is retained in LastError for diagnostics.
+func (ksm *kubeSubnetManager) recordPatchAttempt(nodeName string, attempt int, err error) {
+	ksm.patchStatsMu.Lock()
+	defer ksm.patchStatsMu.Unlock()
+
+	stats, ok := ksm.patchStats[nodeName]
+	if !ok {
+		stats = &nodePatchStats{}
+		ksm.patchStats[nodeName] = stats
+	}
+	stats.Attempts = attempt
+	stats.LastAttempt = time.Now()
+	if err != nil {
+		stats.Failures++
+		stats.LastError = err.Error()
+	} else {
+		stats.LastError = ""
+	}
+}
+
+// NodePatchStats returns a snapshot of the node configuration write statistics
+// keyed by node name, intended for diagnostic/observability consumers.
+func (ksm *kubeSubnetManager) NodePatchStats() map[string]nodePatchStats {
+	ksm.patchStatsMu.Lock()
+	defer ksm.patchStatsMu.Unlock()
+
+	out := make(map[string]nodePatchStats, len(ksm.patchStats))
+	for name, stats := range ksm.patchStats {
+		out[name] = *stats
+	}
+	return out
+}
+
+// patchNodeWithRetry writes the flannel node annotations (the node
+// "configuration") with bounded exponential backoff. Every attempt is logged
+// with its attempt number and failure reason and recorded in the per-node
+// patch statistics so retry counts and causes stay observable.
+//
+// A conflict (HTTP 409) means the node changed since the patch was computed.
+// A strategic merge patch only touches the flannel annotation keys, so after
+// the backoff delay the same patch can simply be retried against the newer
+// object without recomputing it; the informer cache converges in parallel.
+func (ksm *kubeSubnetManager) patchNodeWithRetry(ctx context.Context, patchBytes []byte) error {
+	// Copy the backoff: Step() mutates Steps/Duration, and this method may be
+	// called more than once over the manager's lifetime.
+	bo := ksm.patchBackoff
+	deadlineCtx, cancel := context.WithTimeout(ctx, ksm.patchTimeout)
+	defer cancel()
+
+	var lastErr error
+	attempt := 0
+	for {
+		attempt++
+		_, err := ksm.client.CoreV1().Nodes().Patch(deadlineCtx, ksm.nodeName,
+			types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{}, "status")
+		if err == nil {
+			ksm.recordPatchAttempt(ksm.nodeName, attempt, nil)
+			if attempt > 1 {
+				log.Infof("Successfully patched node %q after %d attempts", ksm.nodeName, attempt)
+			}
+			return nil
+		}
+		lastErr = err
+		ksm.recordPatchAttempt(ksm.nodeName, attempt, err)
+		log.Warningf("Failed to patch node %q (attempt %d/%d): %v",
+			ksm.nodeName, attempt, ksm.patchBackoff.Steps, err)
+
+		// Step returns the delay before the next try and decrements the
+		// remaining steps; zero steps means the budget is exhausted.
+		next := bo.Step()
+		if bo.Steps == 0 {
+			break
+		}
+		select {
+		case <-deadlineCtx.Done():
+			return fmt.Errorf("failed to patch node %q after %s: last error: %v",
+				ksm.nodeName, ksm.patchTimeout, lastErr)
+		case <-time.After(next):
+		}
+	}
+
+	return fmt.Errorf("failed to patch node %q after %d attempts, last error: %v",
+		ksm.nodeName, ksm.patchBackoff.Steps, lastErr)
 }
 
 func (ksm *kubeSubnetManager) GetNetworkConfig(ctx context.Context) (*subnet.Config, error) {
@@ -478,16 +623,8 @@ func (ksm *kubeSubnetManager) AcquireLease(ctx context.Context, attrs *lease.Lea
 			return nil, fmt.Errorf("failed to create patch for node %q: %v", ksm.nodeName, err)
 		}
 
-		waitErr := wait.PollUntilContextTimeout(ctx, 3*time.Second, 30*time.Second, true, func(context.Context) (done bool, err error) {
-			_, err = ksm.client.CoreV1().Nodes().Patch(ctx, ksm.nodeName, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{}, "status")
-			if err != nil {
-				log.V(2).Infof("Failed to patch node %q: %v", ksm.nodeName, err)
-				return false, nil
-			}
-			return true, nil
-		})
-		if waitErr != nil {
-			return nil, fmt.Errorf("timeout contacting kube-api, failed to patch node %q. Error: %v", ksm.nodeName, waitErr)
+		if err := ksm.patchNodeWithRetry(ctx, patchBytes); err != nil {
+			return nil, err
 		}
 	}
 
