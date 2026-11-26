@@ -45,6 +45,45 @@ type LocalManager struct {
 	previousSubnet         ip.IP4Net
 	previousIPv6Subnet     ip.IP6Net
 	subnetLeaseRenewMargin int
+
+	nodeID       string
+	stateFile    string
+	gracePeriod  time.Duration
+	renewBackoff lease.RetryConfig
+}
+
+// LocalManagerOption configures optional stable-lease behavior.
+type LocalManagerOption func(*LocalManager)
+
+// WithNodeID sets the stable node identity stored in lease attributes.
+func WithNodeID(nodeID string) LocalManagerOption {
+	return func(m *LocalManager) {
+		if nodeID != "" {
+			m.nodeID = nodeID
+		}
+	}
+}
+
+// WithLeaseStateFile enables durable local allocation records used to recover
+// the same subnet after a process or node restart.
+func WithLeaseStateFile(path string) LocalManagerOption {
+	return func(m *LocalManager) { m.stateFile = path }
+}
+
+// WithGracePeriod keeps an expired etcd lease physically present for an extra
+// grace interval so a storage blip or node restart cannot immediately allow
+// another node to allocate the same prefix.
+func WithGracePeriod(grace time.Duration) LocalManagerOption {
+	return func(m *LocalManager) {
+		if grace > 0 {
+			m.gracePeriod = grace
+		}
+	}
+}
+
+// WithRenewBackoff overrides the bounded renewal retry policy.
+func WithRenewBackoff(cfg lease.RetryConfig) LocalManagerOption {
+	return func(m *LocalManager) { m.renewBackoff = cfg }
 }
 
 type watchCursor struct {
@@ -62,20 +101,37 @@ func (c watchCursor) String() string {
 	return strconv.FormatInt(c.index, 10)
 }
 
-func NewLocalManager(ctx context.Context, config *EtcdConfig, prevSubnet ip.IP4Net, prevIPv6Subnet ip.IP6Net, subnetLeaseRenewMargin int) (subnet.Manager, error) {
+func NewLocalManager(ctx context.Context, config *EtcdConfig, prevSubnet ip.IP4Net, prevIPv6Subnet ip.IP6Net, subnetLeaseRenewMargin int, opts ...LocalManagerOption) (subnet.Manager, error) {
 	r, err := newEtcdSubnetRegistry(ctx, config, nil)
 	if err != nil {
 		return nil, err
 	}
-	return newLocalManager(r, prevSubnet, prevIPv6Subnet, subnetLeaseRenewMargin), nil
+	m := newLocalManager(r, prevSubnet, prevIPv6Subnet, subnetLeaseRenewMargin)
+	for _, opt := range opts {
+		opt(m)
+	}
+	if err := m.loadLocalState(); err != nil {
+		log.Warningf("Failed to recover local lease state, continuing with subnet file/registry: %v", err)
+	}
+	m.ensureNodeID()
+	return m, nil
 }
 
-func newLocalManager(r Registry, prevSubnet ip.IP4Net, prevIPv6Subnet ip.IP6Net, subnetLeaseRenewMargin int) subnet.Manager {
+func newLocalManager(r Registry, prevSubnet ip.IP4Net, prevIPv6Subnet ip.IP6Net, subnetLeaseRenewMargin int) *LocalManager {
 	return &LocalManager{
 		registry:               r,
 		previousSubnet:         prevSubnet,
 		previousIPv6Subnet:     prevIPv6Subnet,
 		subnetLeaseRenewMargin: subnetLeaseRenewMargin,
+		renewBackoff: lease.RetryConfig{
+			// The cap keeps retries spaced by at most one minute. Sixty attempts
+			// cover the default one-hour renewal margin without hot-looping.
+			MaxAttempts:    60,
+			InitialBackoff: time.Second,
+			MaxBackoff:     time.Minute,
+			Multiplier:     2,
+			JitterFraction: 0.1,
+		},
 	}
 }
 
@@ -104,16 +160,39 @@ func (m *LocalManager) GetNetworkConfig(ctx context.Context) (*subnet.Config, er
 	return config, nil
 }
 
+func (m *LocalManager) physicalLeaseTTL() time.Duration {
+	return subnetTTL + m.gracePeriod
+}
+
+// logicalExpiration removes the reclamation grace extension from an etcd TTL
+// expiration so renewal timing remains anchored to subnetTTL.
+func (m *LocalManager) logicalExpiration(physical time.Time) time.Time {
+	if m.gracePeriod > 0 && !physical.IsZero() {
+		return physical.Add(-m.gracePeriod)
+	}
+	return physical
+}
+
 func (m *LocalManager) AcquireLease(ctx context.Context, attrs *lease.LeaseAttrs) (*lease.Lease, error) {
 	config, err := m.GetNetworkConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
 
+	if attrs.NodeID == "" {
+		attrs.NodeID = m.nodeID
+	}
+
+	var l *lease.Lease
 	for i := 0; i < raceRetries; i++ {
-		l, err := m.tryAcquireLease(ctx, config, attrs.PublicIP, attrs)
+		l, err = m.tryAcquireLease(ctx, config, attrs.PublicIP, attrs)
 		switch err {
 		case nil:
+			l.NodeID = attrs.NodeID
+			l.Expiration = m.logicalExpiration(l.Expiration)
+			if saveErr := m.saveLocalState(l); saveErr != nil {
+				return nil, fmt.Errorf("lease %s allocated in storage but local state was not persisted: %w", l.Subnet, saveErr)
+			}
 			return l, nil
 		case errTryAgain:
 			continue
@@ -123,6 +202,19 @@ func (m *LocalManager) AcquireLease(ctx context.Context, attrs *lease.LeaseAttrs
 	}
 
 	return nil, errors.New("max retries reached trying to acquire a subnet")
+}
+
+func findLeaseByNodeID(leases []lease.Lease, nodeID string) *lease.Lease {
+	if nodeID == "" {
+		return nil
+	}
+	for i := range leases {
+		l := &leases[i]
+		if l.Attrs.NodeID == nodeID || l.NodeID == nodeID {
+			return l
+		}
+	}
+	return nil
 }
 
 func findLeaseByIP(leases []lease.Lease, pubIP ip.IP4) *lease.Lease {
@@ -151,6 +243,33 @@ func (m *LocalManager) tryAcquireLease(ctx context.Context, config *subnet.Confi
 		return nil, err
 	}
 
+	// Stable node identity is the strongest idempotency key. Fall back to the
+	// historical public-IP binding for leases written by older flanneld.
+	nodeID := attrs.NodeID
+	if l := findLeaseByNodeID(leases, nodeID); l != nil {
+		if isSubnetConfigCompat(config, l.Subnet) && isIPv6SubnetConfigCompat(config, l.IPv6Subnet) {
+			log.Infof("Found lease (ip: %v ipv6: %v) for current node %q, reusing", l.Subnet, l.IPv6Subnet, nodeID)
+
+			ttl := time.Duration(0)
+			if !l.Expiration.IsZero() {
+				ttl = m.physicalLeaseTTL()
+			}
+			exp, err := m.registry.updateSubnet(ctx, l.Subnet, l.IPv6Subnet, attrs, ttl, 0)
+			if err != nil {
+				return nil, err
+			}
+
+			l.NodeID = nodeID
+			l.Attrs = *attrs
+			l.Expiration = exp
+			return l, nil
+		}
+		log.Infof("Found node-bound lease (%+v) for node %q but it is incompatible with current config, deleting", l, nodeID)
+		if err := m.registry.deleteSubnet(ctx, l.Subnet, l.IPv6Subnet); err != nil {
+			return nil, err
+		}
+	}
+
 	// Try to reuse a subnet if there's one that matches our IP
 	if l := findLeaseByIP(leases, extIaddr); l != nil {
 		// Make sure the existing subnet is still within the configured network
@@ -160,13 +279,14 @@ func (m *LocalManager) tryAcquireLease(ctx context.Context, config *subnet.Confi
 			ttl := time.Duration(0)
 			if !l.Expiration.IsZero() {
 				// Not a reservation
-				ttl = subnetTTL
+				ttl = m.physicalLeaseTTL()
 			}
 			exp, err := m.registry.updateSubnet(ctx, l.Subnet, l.IPv6Subnet, attrs, ttl, 0)
 			if err != nil {
 				return nil, err
 			}
 
+			l.NodeID = attrs.NodeID
 			l.Attrs = *attrs
 			l.Expiration = exp
 			return l, nil
@@ -203,12 +323,13 @@ func (m *LocalManager) tryAcquireLease(ctx context.Context, config *subnet.Confi
 		}
 	}
 
-	exp, err := m.registry.createSubnet(ctx, sn, sn6, attrs, subnetTTL)
+	exp, err := m.registry.createSubnet(ctx, sn, sn6, attrs, m.physicalLeaseTTL())
 	switch {
 	case err == nil:
 		log.Infof("Allocated lease (ip: %v ipv6: %v) to current node (%v) ", sn, sn6, extIaddr)
 		return &lease.Lease{
 			EnableIPv4: true,
+			NodeID:     attrs.NodeID,
 			Subnet:     sn,
 			EnableIPv6: !sn6.Empty(),
 			IPv6Subnet: sn6,
@@ -274,13 +395,32 @@ OuterLoop:
 }
 
 func (m *LocalManager) RenewLease(ctx context.Context, lease *lease.Lease) error {
-	exp, err := m.registry.updateSubnet(ctx, lease.Subnet, lease.IPv6Subnet, &lease.Attrs, subnetTTL, 0)
+	exp, err := m.registry.updateSubnet(ctx, lease.Subnet, lease.IPv6Subnet, &lease.Attrs, m.physicalLeaseTTL(), 0)
 	if err != nil {
 		return err
 	}
 
-	lease.Expiration = exp
-	return nil
+	lease.Expiration = m.logicalExpiration(exp)
+	if lease.NodeID == "" {
+		lease.NodeID = lease.Attrs.NodeID
+	}
+	return m.saveLocalState(lease)
+}
+
+// RenewLeaseWithRetry renews the storage lease using bounded exponential
+// backoff. The final error wraps the last storage failure and marks retry
+// exhaustion so callers can record/give up according to policy.
+func (m *LocalManager) RenewLeaseWithRetry(ctx context.Context, l *lease.Lease) error {
+	cfg := m.renewBackoff.Normalize()
+	if cfg.OnRetry == nil {
+		cfg.OnRetry = func(attempt int, delay time.Duration, err error) {
+			log.Errorf("Error renewing lease (attempt %d/%d, next retry in %s): %v",
+				attempt, cfg.MaxAttempts, delay, err)
+		}
+	}
+	return lease.RenewWithRetry(ctx, cfg, func(ctx context.Context) error {
+		return m.RenewLease(ctx, l)
+	})
 }
 
 func getNextIndex(cursor interface{}) (int64, error) {
@@ -373,17 +513,35 @@ func (m *LocalManager) CompleteLease(ctx context.Context, myLease *lease.Lease, 
 
 	renewMargin := time.Duration(m.subnetLeaseRenewMargin) * time.Minute
 	dur := time.Until(myLease.Expiration) - renewMargin
+	renewFailures := 0
+	policy := m.renewBackoff.Normalize()
 
 	for {
 		select {
 		case <-time.After(dur):
 			err := m.RenewLease(ctx, myLease)
 			if err != nil {
-				log.Error("Error renewing lease (trying again in 1 min): ", err)
-				dur = time.Minute
+				renewFailures++
+				// The etcd key lives until logical expiration plus the grace
+				// extension. Never schedule another blind update after that
+				// point: the prefix may already have been reallocated.
+				reclamationDeadline := myLease.Expiration.Add(m.gracePeriod)
+				if renewFailures >= policy.MaxAttempts || !time.Now().Before(reclamationDeadline) {
+					exhausted := &lease.RetryExhaustedError{Attempts: renewFailures, LastError: err}
+					log.Errorf("Giving up renewing lease %s after %d attempts: %v", myLease.Subnet, renewFailures, err)
+					return exhausted
+				}
+
+				dur = policy.BackoffForAttempt(renewFailures + 1)
+				if remaining := time.Until(reclamationDeadline); dur > remaining {
+					dur = remaining
+				}
+				log.Errorf("Error renewing lease (attempt %d/%d, retrying in %s): %v",
+					renewFailures, policy.MaxAttempts, dur, err)
 				continue
 			}
 
+			renewFailures = 0
 			log.Info("Lease renewed, new expiration: ", myLease.Expiration)
 			dur = time.Until(myLease.Expiration) - renewMargin
 
@@ -394,7 +552,7 @@ func (m *LocalManager) CompleteLease(ctx context.Context, myLease *lease.Lease, 
 			}
 			switch e.Type {
 			case lease.EventAdded:
-				myLease.Expiration = e.Lease.Expiration
+				myLease.Expiration = m.logicalExpiration(e.Lease.Expiration)
 				dur = time.Until(myLease.Expiration) - renewMargin
 				log.Infof("Waiting for %s to renew lease", dur)
 

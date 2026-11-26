@@ -348,6 +348,9 @@ func (ksm *kubeSubnetManager) GetNetworkConfig(ctx context.Context) (*subnet.Con
 // with important information for the backend, such as the subnet. This function is called once by the backend when
 // registering
 func (ksm *kubeSubnetManager) AcquireLease(ctx context.Context, attrs *lease.LeaseAttrs) (*lease.Lease, error) {
+	if attrs.NodeID == "" {
+		attrs.NodeID = ksm.nodeName
+	}
 	var cachedNode *v1.Node
 	waitErr := wait.PollUntilContextTimeout(ctx, 3*time.Second, 30*time.Second, true, func(context.Context) (done bool, err error) {
 		if ksm.disableNodeInformer {
@@ -492,6 +495,7 @@ func (ksm *kubeSubnetManager) AcquireLease(ctx context.Context, attrs *lease.Lea
 	}
 
 	lease := &lease.Lease{
+		NodeID:     ksm.nodeName,
 		Attrs:      *attrs,
 		Expiration: time.Now().Add(24 * time.Hour),
 	}
@@ -540,6 +544,8 @@ func (ksm *kubeSubnetManager) Run(ctx context.Context) {
 
 // nodeToLease updates the lease with information fetch from the node, e.g. PodCIDR
 func (ksm *kubeSubnetManager) nodeToLease(n v1.Node) (l lease.Lease, err error) {
+	l.NodeID = n.Name
+	l.Attrs.NodeID = n.Name
 	if ksm.enableIPv4 {
 		l.Attrs.PublicIP, err = ip.ParseIP4(n.Annotations[ksm.annotations.BackendPublicIP])
 		if err != nil {

@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -35,6 +36,7 @@ import (
 	"github.com/coreos/pkg/flagutil"
 	"github.com/flannel-io/flannel/pkg/ip"
 	"github.com/flannel-io/flannel/pkg/ipmatch"
+	"github.com/flannel-io/flannel/pkg/lease"
 	"github.com/flannel-io/flannel/pkg/subnet"
 	etcd "github.com/flannel-io/flannel/pkg/subnet/etcd"
 	"github.com/flannel-io/flannel/pkg/subnet/kube"
@@ -89,6 +91,10 @@ type CmdLineOpts struct {
 	ipMasqRandomFullyDisable  bool
 	ifaceCanReach             string
 	subnetFile                string
+	leaseStateFile            string
+	nodeID                    string
+	leaseGracePeriod          time.Duration
+	leaseRenewMaxAttempts     int
 	publicIP                  string
 	publicIPv6                string
 	subnetLeaseRenewMargin    int
@@ -122,6 +128,10 @@ func init() {
 	flannelFlags.Var(&opts.ifaceRegex, "iface-regex", "regex expression to match the first interface to use (IP or name) for inter-host communication. Can be specified multiple times to check each regex in order. Returns the first match found. Regexes are checked after specific interfaces specified by the iface option have already been checked.")
 	flannelFlags.StringVar(&opts.ifaceCanReach, "iface-can-reach", "", "detect interface to use (IP or name) for inter-host communication based on which will be used for provided IP. This is exactly the interface to use of command 'ip route get <ip-address>'")
 	flannelFlags.StringVar(&opts.subnetFile, "subnet-file", "/run/flannel/subnet.env", "filename where env variables (subnet, MTU, ... ) will be written to")
+	flannelFlags.StringVar(&opts.leaseStateFile, "lease-state-file", "", "filename where the stable node-to-subnet lease binding will be persisted (default: lease-state.json next to --subnet-file)")
+	flannelFlags.StringVar(&opts.nodeID, "node-id", "", "stable node identity used for idempotent lease allocation (defaults to NODE_NAME or hostname)")
+	flannelFlags.DurationVar(&opts.leaseGracePeriod, "lease-grace-period", 15*time.Minute, "time an expired lease prefix remains reserved for its owner before reclamation")
+	flannelFlags.IntVar(&opts.leaseRenewMaxAttempts, "lease-renew-max-attempts", 60, "maximum consecutive lease renewal attempts before giving up")
 	flannelFlags.StringVar(&opts.publicIP, "public-ip", "", "IP accessible by other nodes for inter-host communication")
 	flannelFlags.StringVar(&opts.publicIPv6, "public-ipv6", "", "IPv6 accessible by other nodes for inter-host communication")
 	flannelFlags.IntVar(&opts.subnetLeaseRenewMargin, "subnet-lease-renew-margin", 60, "subnet lease renewal margin, in minutes, ranging from 1 to 1439")
@@ -211,7 +221,28 @@ func newSubnetManager(ctx context.Context) (subnet.Manager, error) {
 	prevSubnet := ReadCIDRFromSubnetFile(opts.subnetFile, "FLANNEL_SUBNET")
 	prevIPv6Subnet := ReadIP6CIDRFromSubnetFile(opts.subnetFile, "FLANNEL_IPV6_SUBNET")
 
-	return etcd.NewLocalManager(ctx, cfg, prevSubnet, prevIPv6Subnet, opts.subnetLeaseRenewMargin)
+	// Only an explicit --node-id overrides the durable local identity. The
+	// etcd manager recovers a previously persisted NodeID before falling back
+	// to NODE_NAME/hostname so a renamed or reprovisioned host can still reuse
+	// its subnet.
+	nodeID := opts.nodeID
+
+	renewBackoff := lease.DefaultRetryConfig()
+	if opts.leaseRenewMaxAttempts > 0 {
+		renewBackoff.MaxAttempts = opts.leaseRenewMaxAttempts
+	}
+
+	stateFile := opts.leaseStateFile
+	if stateFile == "" {
+		stateFile = filepath.Join(filepath.Dir(opts.subnetFile), "lease-state.json")
+	}
+
+	return etcd.NewLocalManager(ctx, cfg, prevSubnet, prevIPv6Subnet, opts.subnetLeaseRenewMargin,
+		etcd.WithNodeID(nodeID),
+		etcd.WithLeaseStateFile(stateFile),
+		etcd.WithGracePeriod(opts.leaseGracePeriod),
+		etcd.WithRenewBackoff(renewBackoff),
+	)
 }
 
 func main() {
@@ -502,6 +533,13 @@ func main() {
 		log.Errorf("CompleteLease execute error err: %v", err)
 		if strings.EqualFold(err.Error(), errInterrupted.Error()) {
 			// The lease was "revoked" - shut everything down
+			cancel()
+		}
+		if errors.Is(err, lease.ErrRetryExhausted) {
+			// Renewal has exceeded its configured threshold. Exit so the
+			// supervisor restarts flanneld and recovery can reuse the durable
+			// local lease binding instead of running indefinitely unrenewed.
+			log.Errorf("Lease renewal failed permanently; requesting process restart: %v", err)
 			cancel()
 		}
 	}

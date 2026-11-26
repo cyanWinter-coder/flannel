@@ -45,7 +45,14 @@ The value of the config is a JSON dictionary with the following keys:
    Defaults to `vxlan` backend.
 
 Subnet leases have a duration of 24 hours. Leases are renewed within 1 hour of their expiration,
-unless a different renewal margin is set with the ``--subnet-lease-renew-margin`` option.
+unless a different renewal margin is set with the ``--subnet-lease-renew-margin`` option. Renewal
+failures use exponential backoff up to ``--lease-renew-max-attempts``; when the threshold is reached
+flanneld records the last storage error and exits so its supervisor can restart it. Expired etcd
+leases remain reclaimable by their previous owner for an additional
+``--lease-grace-period`` (15 minutes by default), which prevents a short storage or node restart
+blip from immediately exposing the same subnet to another node. The stable node-to-subnet binding is
+atomically persisted next to the subnet file, or at ``--lease-state-file``, and is reused first after
+a restart.
 
 ## Example configuration JSON
 
@@ -80,6 +87,10 @@ The following configuration illustrates the use of most options with `udp` backe
 --iptables-forward-rules: Adds default ACCEPT rules to the iptables FORWARD chain to allow network traffic forwarding (default: true).
 --iptables-resync=5: resync period for iptables rules, in seconds. Defaults to 5 seconds, if you see a large amount of contention for the iptables lock increasing this will probably help.
 --subnet-file=/run/flannel/subnet.env: filename where env variables (subnet and MTU values) will be written to.
+--lease-state-file="": filename for the persisted stable node-to-subnet lease binding. Defaults to lease-state.json in the same directory as --subnet-file.
+--node-id="": stable node identity used for idempotent lease allocation. Defaults to NODE_NAME and then the operating system hostname; a NodeID recovered from the lease state file takes precedence over those defaults.
+--lease-grace-period=15m: time an expired etcd lease prefix remains reserved for its previous owner before reclamation.
+--lease-renew-max-attempts=60: maximum consecutive lease renewal attempts before flanneld gives up and requests restart.
 --net-config-path=/etc/kube-flannel/net-conf.json: path to the network configuration file to use
 --subnet-lease-renew-margin=60: subnet lease renewal margin, in minutes.
 --ip-masq=false: setup IP masquerade for traffic destined for outside the flannel network. Flannel assumes that the default policy is ACCEPT in the NAT POSTROUTING chain.

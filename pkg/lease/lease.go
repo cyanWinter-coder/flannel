@@ -40,6 +40,9 @@ type (
 
 // LeaseAttrs includes extra information for the lease
 type LeaseAttrs struct {
+	// NodeID is the stable identity of the node owning the lease. When set it
+	// takes precedence over PublicIP for idempotent lease lookup.
+	NodeID        string `json:"NodeID,omitempty"`
 	PublicIP      ip.IP4
 	PublicIPv6    *ip.IP6
 	BackendType   string          `json:",omitempty"`
@@ -47,10 +50,21 @@ type LeaseAttrs struct {
 	BackendV6Data json.RawMessage `json:",omitempty"`
 }
 
+// Identity returns the strongest stable owner identifier available.
+func (la LeaseAttrs) Identity() string {
+	if la.NodeID != "" {
+		return "node:" + la.NodeID
+	}
+	return "ipv4:" + la.PublicIP.String()
+}
+
 // Lease includes information about the lease
 type Lease struct {
 	EnableIPv4 bool
 	EnableIPv6 bool
+	// NodeID mirrors Attrs.NodeID and makes the owner binding explicit at the
+	// Lease API level.
+	NodeID     string
 	Subnet     ip.IP4Net
 	IPv6Subnet ip.IP6Net
 	Attrs      LeaseAttrs
@@ -75,6 +89,9 @@ type LeaseWatcher struct {
 
 func (la *LeaseAttrs) String() string {
 	var buffer bytes.Buffer
+	if la.NodeID != "" {
+		fmt.Fprintf(&buffer, "NodeID: %s, ", la.NodeID)
+	}
 	fmt.Fprintf(&buffer, "BackendType: %s, PublicIP: %s, ", la.BackendType, la.PublicIP.String())
 	if la.PublicIPv6 != nil {
 		fmt.Fprintf(&buffer, "PublicIPv6: %s, ", la.PublicIPv6.String())

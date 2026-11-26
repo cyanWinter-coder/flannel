@@ -500,6 +500,7 @@ func parseSubnetWatchResponse(ctx context.Context, cli *etcd.Client, ev *etcd.Ev
 			Type: lease.EventAdded,
 			Lease: lease.Lease{
 				EnableIPv4: true,
+				NodeID:     attrs.NodeID,
 				Subnet:     *sn,
 				EnableIPv6: !sn6.Empty(),
 				IPv6Subnet: sn6,
@@ -531,6 +532,7 @@ func kvToIPLease(kv *mvccpb.KeyValue, ttl int64) (*lease.Lease, error) {
 
 	lease := lease.Lease{
 		EnableIPv4: true,
+		NodeID:     attrs.NodeID,
 		EnableIPv6: !sn6.Empty(),
 		Subnet:     *sn,
 		IPv6Subnet: sn6,

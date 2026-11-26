@@ -16,6 +16,7 @@ package subnet
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -151,47 +152,61 @@ func WatchLeases(ctx context.Context, sm Manager, ownLease *lease.Lease, receive
 // of handling "fall-behind" logic where the history window has advanced too far
 // and it needs to diff the latest snapshot with its saved state and generate events
 func WatchLease(ctx context.Context, sm Manager, sn ip.IP4Net, sn6 ip.IP6Net, receiver chan lease.Event) {
-	leaseWatchChan := make(chan []lease.LeaseWatchResult)
-	var closeOnce sync.Once
+	// Only this goroutine closes receiver. The watch implementation may return
+	// without closing leaseWatchChan, so track its exit separately instead of
+	// closing receiver from a second goroutine and racing with in-flight sends.
+	defer close(receiver)
 
-	// Helper function to close the receiver channel safely
-	closeReceiver := func() {
-		closeOnce.Do(func() {
-			close(receiver)
-		})
-	}
+	leaseWatchChan := make(chan []lease.LeaseWatchResult)
+	watchExited := make(chan struct{})
 
 	go func() {
-		err := sm.WatchLease(ctx, sn, sn6, leaseWatchChan)
-		if err != nil {
-			if err == context.Canceled || err == context.DeadlineExceeded {
-				log.Infof("%v, close receiver chan", err)
-				closeReceiver()
+		defer close(watchExited)
+		if err := sm.WatchLease(ctx, sn, sn6, leaseWatchChan); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				log.Infof("%v, stop lease watcher", err)
+				return
+			}
+			log.Errorf("Subnet watch failed: %v", err)
+		}
+	}()
+
+	deliver := func(event lease.Event) bool {
+		select {
+		case receiver <- event:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Infof("%v, close receiver chan", ctx.Err())
+			return
+		case <-watchExited:
+			log.Info("lease watcher exited, closing receiver channel")
+			return
+		case watchResults, ok := <-leaseWatchChan:
+			if !ok {
+				log.Info("leaseWatchChan channel closed")
 				return
 			}
 
-			log.Errorf("Subnet watch failed: %v", err)
-			closeReceiver()
-			return
-		}
-
-	}()
-
-	for watchResults := range leaseWatchChan {
-		for _, wr := range watchResults {
-			if len(wr.Snapshot) > 0 {
-				receiver <- lease.Event{
-					Type:  lease.EventAdded,
-					Lease: wr.Snapshot[0],
+			for _, wr := range watchResults {
+				if len(wr.Snapshot) > 0 {
+					if !deliver(lease.Event{Type: lease.EventAdded, Lease: wr.Snapshot[0]}) {
+						return
+					}
+				} else if len(wr.Events) > 0 {
+					if !deliver(wr.Events[0]) {
+						return
+					}
+				} else {
+					log.V(2).Info("WatchLease: empty event received")
 				}
-			} else if len(wr.Events) > 0 {
-				receiver <- wr.Events[0]
-			} else {
-				log.V(2).Info("WatchLease: empty event received")
 			}
 		}
-
 	}
-	log.Info("leaseWatchChan channel closed")
-	closeReceiver()
 }
