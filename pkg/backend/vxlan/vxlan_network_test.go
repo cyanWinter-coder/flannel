@@ -434,6 +434,9 @@ func TestRecreatedDeviceGetsKnownLeases(t *testing.T) {
 		dev:           dev,
 		subnetMgr:     sm,
 	}
+	nw.fp = newForwardingPlane()
+	nw.fp.setDevices(dev, nil)
+	nw.fp.trackDevice(dev.link.Attrs().Name)
 	nw.knownLeases.OwnLease = own
 
 	// What Run does for a lease event.

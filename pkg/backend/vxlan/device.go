@@ -44,6 +44,10 @@ type vxlanDeviceAttrs struct {
 type vxlanDevice struct {
 	link          *netlink.Vxlan
 	directRouting bool
+	// created is true when this process created the underlying link, false
+	// when it adopted a compatible pre-existing device. Only created devices
+	// are eligible for rollback and shutdown cleanup.
+	created bool
 }
 
 func newVXLANDevice(devAttrs *vxlanDeviceAttrs) (*vxlanDevice, error) {
@@ -70,7 +74,7 @@ func newVXLANDevice(devAttrs *vxlanDeviceAttrs) (*vxlanDevice, error) {
 		GBP:          devAttrs.gbp,
 	}
 
-	link, err = ensureLink(link)
+	link, created, err := ensureLink(link)
 	if err != nil {
 		return nil, err
 	}
@@ -78,52 +82,56 @@ func newVXLANDevice(devAttrs *vxlanDeviceAttrs) (*vxlanDevice, error) {
 	_, _ = sysctl.Sysctl(fmt.Sprintf("net/ipv6/conf/%s/accept_ra", devAttrs.name), "0")
 
 	return &vxlanDevice{
-		link: link,
+		link:    link,
+		created: created,
 	}, nil
 }
 
-func ensureLink(vxlan *netlink.Vxlan) (*netlink.Vxlan, error) {
+// ensureLink creates the VXLAN link, or adopts an existing compatible one.
+// The returned boolean reports whether the link was newly created (true) or
+// pre-existing and merely adopted (false), so callers know what they own.
+func ensureLink(vxlan *netlink.Vxlan) (*netlink.Vxlan, bool, error) {
 	err := netlink.LinkAdd(vxlan)
 	if err == syscall.EEXIST {
 		// it's ok if the device already exists as long as config is similar
 		log.V(1).Infof("VXLAN device already exists")
 		existing, err := netlink.LinkByName(vxlan.Name)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 
 		incompat := vxlanLinksIncompat(vxlan, existing)
 		if incompat == "" {
 			log.V(1).Infof("Returning existing device")
-			return existing.(*netlink.Vxlan), nil
+			return existing.(*netlink.Vxlan), false, nil
 		}
 
 		// delete existing
 		log.Warningf("%q already exists with incompatible configuration: %v; recreating device", vxlan.Name, incompat)
 		if err = netlink.LinkDel(existing); err != nil {
-			return nil, fmt.Errorf("failed to delete interface: %v", err)
+			return nil, false, fmt.Errorf("failed to delete interface: %v", err)
 		}
 
 		// create new
 		if err = netlink.LinkAdd(vxlan); err != nil {
-			return nil, fmt.Errorf("failed to create vxlan interface: %v", err)
+			return nil, false, fmt.Errorf("failed to create vxlan interface: %v", err)
 		}
 	} else if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	ifindex := vxlan.Index
 	link, err := netlink.LinkByIndex(vxlan.Index)
 	if err != nil {
-		return nil, fmt.Errorf("can't locate created vxlan device with index %v", ifindex)
+		return nil, false, fmt.Errorf("can't locate created vxlan device with index %v", ifindex)
 	}
 
 	var ok bool
 	if vxlan, ok = link.(*netlink.Vxlan); !ok {
-		return nil, fmt.Errorf("created vxlan device with index %v is not vxlan", ifindex)
+		return nil, false, fmt.Errorf("created vxlan device with index %v is not vxlan", ifindex)
 	}
 
-	return vxlan, nil
+	return vxlan, true, nil
 }
 
 func (dev *vxlanDevice) Configure(ipa ip.IP4Net, flannelnet ip.IP4Net) error {
@@ -176,100 +184,21 @@ func (dev *vxlanDevice) MACAddr() net.HardwareAddr {
 	return dev.link.HardwareAddr
 }
 
-type neighbor struct {
-	MAC net.HardwareAddr
-	IP  ip.IP4
-	IP6 *ip.IP6
-}
-
-func (dev *vxlanDevice) AddFDB(n neighbor) error {
-	log.V(4).Infof("calling AddFDB: %v, %v", n.IP, n.MAC)
-	return netlink.NeighSet(&netlink.Neigh{
-		LinkIndex:    dev.link.Index,
-		State:        netlink.NUD_PERMANENT,
-		Family:       syscall.AF_BRIDGE,
-		Flags:        netlink.NTF_SELF,
-		IP:           n.IP.ToIP(),
-		HardwareAddr: n.MAC,
-	})
-}
-
-func (dev *vxlanDevice) AddV6FDB(n neighbor) error {
-	log.V(4).Infof("calling AddV6FDB: %v, %v", n.IP6, n.MAC)
-	return netlink.NeighSet(&netlink.Neigh{
-		LinkIndex:    dev.link.Index,
-		State:        netlink.NUD_PERMANENT,
-		Family:       syscall.AF_BRIDGE,
-		Flags:        netlink.NTF_SELF,
-		IP:           n.IP6.ToIP(),
-		HardwareAddr: n.MAC,
-	})
-}
-
-func (dev *vxlanDevice) DelFDB(n neighbor) error {
-	log.V(4).Infof("calling DelFDB: %v, %v", n.IP, n.MAC)
-	return netlink.NeighDel(&netlink.Neigh{
-		LinkIndex:    dev.link.Index,
-		Family:       syscall.AF_BRIDGE,
-		Flags:        netlink.NTF_SELF,
-		IP:           n.IP.ToIP(),
-		HardwareAddr: n.MAC,
-	})
-}
-
-func (dev *vxlanDevice) DelV6FDB(n neighbor) error {
-	log.V(4).Infof("calling DelV6FDB: %v, %v", n.IP6, n.MAC)
-	return netlink.NeighDel(&netlink.Neigh{
-		LinkIndex:    dev.link.Index,
-		Family:       syscall.AF_BRIDGE,
-		Flags:        netlink.NTF_SELF,
-		IP:           n.IP6.ToIP(),
-		HardwareAddr: n.MAC,
-	})
-}
-
-func (dev *vxlanDevice) AddARP(n neighbor) error {
-	log.V(4).Infof("calling AddARP: %v, %v", n.IP, n.MAC)
-	return netlink.NeighSet(&netlink.Neigh{
-		LinkIndex:    dev.link.Index,
-		State:        netlink.NUD_PERMANENT,
-		Type:         syscall.RTN_UNICAST,
-		IP:           n.IP.ToIP(),
-		HardwareAddr: n.MAC,
-	})
-}
-
-func (dev *vxlanDevice) AddV6ARP(n neighbor) error {
-	log.V(4).Infof("calling AddV6ARP: %v, %v", n.IP6, n.MAC)
-	return netlink.NeighSet(&netlink.Neigh{
-		LinkIndex:    dev.link.Index,
-		State:        netlink.NUD_PERMANENT,
-		Type:         syscall.RTN_UNICAST,
-		IP:           n.IP6.ToIP(),
-		HardwareAddr: n.MAC,
-	})
-}
-
-func (dev *vxlanDevice) DelARP(n neighbor) error {
-	log.V(4).Infof("calling DelARP: %v, %v", n.IP, n.MAC)
-	return netlink.NeighDel(&netlink.Neigh{
-		LinkIndex:    dev.link.Index,
-		State:        netlink.NUD_PERMANENT,
-		Type:         syscall.RTN_UNICAST,
-		IP:           n.IP.ToIP(),
-		HardwareAddr: n.MAC,
-	})
-}
-
-func (dev *vxlanDevice) DelV6ARP(n neighbor) error {
-	log.V(4).Infof("calling DelV6ARP: %v, %v", n.IP6, n.MAC)
-	return netlink.NeighDel(&netlink.Neigh{
-		LinkIndex:    dev.link.Index,
-		State:        netlink.NUD_PERMANENT,
-		Type:         syscall.RTN_UNICAST,
-		IP:           n.IP6.ToIP(),
-		HardwareAddr: n.MAC,
-	})
+// rollbackCreatedDevices deletes the VXLAN devices that were newly created
+// (not adopted) after a later setup step failed. It is best-effort: a failed
+// deletion is logged but does not stop the other rollbacks, and adopted
+// pre-existing devices are never touched.
+func rollbackCreatedDevices(devices ...*vxlanDevice) {
+	for _, dev := range devices {
+		if dev == nil || !dev.created {
+			continue
+		}
+		name := dev.link.Attrs().Name
+		log.Warningf("rolling back vxlan device %s after creation failure", name)
+		if err := netlink.LinkDel(dev.link); err != nil && !isNotExist(err) {
+			log.Errorf("rollback failed to delete device %s: %v", name, err)
+		}
+	}
 }
 
 func vxlanLinksIncompat(l1, l2 netlink.Link) string {

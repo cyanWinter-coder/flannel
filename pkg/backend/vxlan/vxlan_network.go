@@ -19,16 +19,15 @@ package vxlan
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/flannel-io/flannel/pkg/backend"
 	"github.com/flannel-io/flannel/pkg/ip"
 	"github.com/flannel-io/flannel/pkg/lease"
-	"github.com/flannel-io/flannel/pkg/retry"
 	"github.com/flannel-io/flannel/pkg/subnet"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -41,6 +40,13 @@ type network struct {
 	v6Dev     *vxlanDevice
 	subnetMgr subnet.Manager
 	mtu       int
+
+	// fp is the authoritative in-memory registry of the ARP, FDB and route
+	// entries this process installed, plus the VXLAN devices it created. All
+	// kernel mutations go through it so the registry and the data plane stay
+	// consistent, entries can age out and be relearned, and shutdown can
+	// remove exactly what flannel owns.
+	fp *forwardingPlane
 
 	// knownLeases holds the remote leases that have been handed to
 	// handleSubnetEvents, so that their ARP, FDB and route entries can be
@@ -61,6 +67,17 @@ const (
 )
 
 func newNetwork(subnetMgr subnet.Manager, extIface *backend.ExternalInterface, dev *vxlanDevice, v6Dev *vxlanDevice, _ ip.IP4Net, lease *lease.Lease, mtu int) (*network, error) {
+	fp := newForwardingPlane()
+	fp.setDevices(dev, v6Dev)
+	// The devices handed in here were created (or adopted) during
+	// RegisterNetwork; only ones this process created are owned at Close.
+	if dev != nil && dev.created {
+		fp.trackDevice(dev.link.Attrs().Name)
+	}
+	if v6Dev != nil && v6Dev.created {
+		fp.trackDevice(v6Dev.link.Attrs().Name)
+	}
+
 	nw := &network{
 		SimpleNetwork: backend.SimpleNetwork{
 			SubnetLease: lease,
@@ -70,6 +87,7 @@ func newNetwork(subnetMgr subnet.Manager, extIface *backend.ExternalInterface, d
 		dev:       dev,
 		v6Dev:     v6Dev,
 		mtu:       mtu,
+		fp:        fp,
 	}
 
 	return nw, nil
@@ -98,7 +116,20 @@ func (nw *network) Run(ctx context.Context) {
 		wg.Done()
 	}()
 
-	defer wg.Wait()
+	// Periodically re-assert aged entries so stale ARP/FDB/route state
+	// (e.g. an FDB record pointing at a restarted node's old VTEP MAC) is
+	// relearned from the authoritative leases.
+	go nw.fp.runReconciler(ctx)
+
+	defer func() {
+		wg.Wait()
+		// Every exit path runs the idempotent teardown: remove the entries
+		// and devices this process created. Close itself guards against
+		// being invoked more than once.
+		if err := nw.fp.Close(); err != nil {
+			log.Errorf("error during vxlan forwarding plane shutdown: %v", err)
+		}
+	}()
 
 	for {
 		select {
@@ -134,8 +165,22 @@ func (nw *network) Run(ctx context.Context) {
 
 		case recreated := <-vxlanRecreatedChan:
 			nw.useRecreatedDevices(recreated)
+
+		case <-ctx.Done():
+			log.Info("vxlan network context canceled, exiting Run loop")
+			return
 		}
 	}
+}
+
+// Close tears down the forwarding plane. It is safe to call more than once
+// and safe to call while Run is also exiting: forwardingPlane.Close is
+// synchronized and idempotent.
+func (nw *network) Close() error {
+	if nw.fp == nil {
+		return nil
+	}
+	return nw.fp.Close()
 }
 
 // useRecreatedDevices installs the devices built by reCreateVxlan and writes
@@ -150,6 +195,17 @@ func (nw *network) useRecreatedDevices(recreated recreatedDevices) {
 		nw.mtu = nw.dev.link.Attrs().MTU
 	} else if nw.v6Dev != nil {
 		nw.mtu = nw.v6Dev.link.Attrs().MTU
+	}
+
+	// The old device took every kernel entry with it and the recreated
+	// devices are freshly created, so the registry starts empty and any
+	// newly created devices become owned by this process.
+	nw.fp.setDevices(recreated.dev, recreated.v6Dev)
+	if recreated.dev != nil && recreated.dev.created {
+		nw.fp.trackDevice(recreated.dev.link.Attrs().Name)
+	}
+	if recreated.v6Dev != nil && recreated.v6Dev.created {
+		nw.fp.trackDevice(recreated.v6Dev.link.Attrs().Name)
 	}
 
 	batch := nw.knownLeaseEvents()
@@ -359,6 +415,10 @@ func (nw *network) reCreateVxlan(ctx context.Context) (*vxlanDevice, *vxlanDevic
 
 		if err := configureDeviceIPv4IPv6(dev, v6Dev, nw.SubnetLease, config); err != nil {
 			log.Errorf("failed to configure vxlan device: %v", err)
+			// configureDeviceIPv4IPv6 does not roll back on failure; remove
+			// the devices this attempt created before retrying so repeated
+			// recreate cycles do not accumulate half-configured devices.
+			rollbackCreatedDevices(dev, v6Dev)
 			retryAfterBackoff(&backoff, maxBackoff)
 			continue
 		}
@@ -406,249 +466,131 @@ func (nw *network) handleSubnetEvents(batch []lease.Event) {
 			continue
 		}
 
-		var (
-			vxlanAttrs, v6VxlanAttrs           vxlanLeaseAttrs
-			directRoutingOK, v6DirectRoutingOK bool
-			directRoute, v6DirectRoute         netlink.Route
-			vxlanRoute, v6VxlanRoute           netlink.Route
-		)
-
-		if event.Lease.EnableIPv4 && nw.dev != nil {
-			if err := json.Unmarshal(attrs.BackendData, &vxlanAttrs); err != nil {
-				log.Error("error decoding subnet lease JSON: ", err)
-				continue
-			}
-
-			// This route is used when traffic should be vxlan encapsulated
-			vxlanRoute = netlink.Route{
-				LinkIndex: nw.dev.link.Attrs().Index,
-				Scope:     netlink.SCOPE_UNIVERSE,
-				Dst:       sn.ToIPNet(),
-				Gw:        sn.IP.ToIP(),
-			}
-			vxlanRoute.SetFlag(syscall.RTNH_F_ONLINK)
-
-			// directRouting is where the remote host is on the same subnet so vxlan isn't required.
-			directRoute = netlink.Route{
-				Dst: sn.ToIPNet(),
-				Gw:  attrs.PublicIP.ToIP(),
-			}
-			if nw.dev.directRouting {
-				if dr, err := ip.DirectRouting(attrs.PublicIP.ToIP()); err != nil {
-					log.Error(err)
-				} else {
-					directRoutingOK = dr
-				}
-			}
-		}
-
-		if event.Lease.EnableIPv6 && nw.v6Dev != nil {
-			if err := json.Unmarshal(attrs.BackendV6Data, &v6VxlanAttrs); err != nil {
-				log.Error("error decoding v6 subnet lease JSON: ", err)
-				continue
-			}
-			if v6Sn.IP != nil && nw.v6Dev != nil {
-				v6VxlanRoute = netlink.Route{
-					LinkIndex: nw.v6Dev.link.Attrs().Index,
-					Scope:     netlink.SCOPE_UNIVERSE,
-					Dst:       v6Sn.ToIPNet(),
-					Gw:        v6Sn.IP.ToIP(),
-				}
-				v6VxlanRoute.SetFlag(syscall.RTNH_F_ONLINK)
-
-				// directRouting is where the remote host is on the same subnet so vxlan isn't required.
-				v6DirectRoute = netlink.Route{
-					Dst: v6Sn.ToIPNet(),
-					Gw:  attrs.PublicIPv6.ToIP(),
-				}
-
-				if nw.v6Dev.directRouting {
-					if v6Dr, err := ip.DirectRouting(attrs.PublicIPv6.ToIP()); err != nil {
-						log.Error(err)
-					} else {
-						v6DirectRoutingOK = v6Dr
-					}
-				}
-			}
-		}
-
 		switch event.Type {
 		case lease.EventAdded:
-			if event.Lease.EnableIPv4 {
-				if directRoutingOK {
-					log.V(2).Infof("Adding direct route to subnet: %s PublicIP: %s", sn, attrs.PublicIP)
-
-					if err := retry.Do(func() error {
-						return netlink.RouteReplace(&directRoute)
-					}); err != nil {
-						log.Errorf("Error adding route to %v via %v: %v", sn, attrs.PublicIP, err)
-						continue
-					}
-				} else {
-					log.V(2).Infof("adding subnet: %s PublicIP: %s VtepMAC: %s", sn, attrs.PublicIP, net.HardwareAddr(vxlanAttrs.VtepMAC))
-					if err := retry.Do(func() error {
-						return nw.dev.AddARP(neighbor{IP: sn.IP, MAC: net.HardwareAddr(vxlanAttrs.VtepMAC)})
-					}); err != nil {
-						log.Error("AddARP failed: ", err)
-						continue
-					}
-
-					if err := retry.Do(func() error {
-						return nw.dev.AddFDB(neighbor{IP: attrs.PublicIP, MAC: net.HardwareAddr(vxlanAttrs.VtepMAC)})
-					}); err != nil {
-						log.Error("AddFDB failed: ", err)
-
-						// Try to clean up the ARP entry then continue
-						if err := retry.Do(func() error {
-							return nw.dev.DelARP(neighbor{IP: event.Lease.Subnet.IP, MAC: net.HardwareAddr(vxlanAttrs.VtepMAC)})
-						}); err != nil {
-							log.Error("DelARP failed: ", err)
-						}
-
-						continue
-					}
-
-					// Set the route - the kernel would ARP for the Gw IP address if it hadn't already been set above so make sure
-					// this is done last.
-					if err := retry.Do(func() error {
-						return netlink.RouteReplace(&vxlanRoute)
-					}); err != nil {
-						log.Errorf("failed to add vxlanRoute (%s -> %s): %v", vxlanRoute.Dst, vxlanRoute.Gw, err)
-
-						// Try to clean up both the ARP and FDB entries then continue
-						if err := nw.dev.DelARP(neighbor{IP: event.Lease.Subnet.IP, MAC: net.HardwareAddr(vxlanAttrs.VtepMAC)}); err != nil {
-							log.Error("DelARP failed: ", err)
-						}
-
-						if err := nw.dev.DelFDB(neighbor{IP: event.Lease.Attrs.PublicIP, MAC: net.HardwareAddr(vxlanAttrs.VtepMAC)}); err != nil {
-							log.Error("DelFDB failed: ", err)
-						}
-
-						continue
-					}
-				}
-			}
-			if event.Lease.EnableIPv6 {
-				if v6DirectRoutingOK {
-					log.V(2).Infof("Adding v6 direct route to v6 subnet: %s PublicIPv6: %s", v6Sn, attrs.PublicIPv6)
-
-					if err := retry.Do(func() error {
-						return netlink.RouteReplace(&v6DirectRoute)
-					}); err != nil {
-						log.Errorf("Error adding v6 route to %v via %v: %v", v6Sn, attrs.PublicIPv6, err)
-						continue
-					}
-				} else {
-					log.V(2).Infof("adding v6 subnet: %s PublicIPv6: %s VtepMAC: %s", v6Sn, attrs.PublicIPv6, net.HardwareAddr(v6VxlanAttrs.VtepMAC))
-					if err := retry.Do(func() error {
-						return nw.v6Dev.AddV6ARP(neighbor{IP6: v6Sn.IP, MAC: net.HardwareAddr(v6VxlanAttrs.VtepMAC)})
-					}); err != nil {
-						log.Error("AddV6ARP failed: ", err)
-						continue
-					}
-
-					if err := retry.Do(func() error {
-						return nw.v6Dev.AddV6FDB(neighbor{IP6: attrs.PublicIPv6, MAC: net.HardwareAddr(v6VxlanAttrs.VtepMAC)})
-					}); err != nil {
-						log.Error("AddV6FDB failed: ", err)
-
-						// Try to clean up the ARP entry then continue
-						if err := nw.v6Dev.DelV6ARP(neighbor{IP6: event.Lease.IPv6Subnet.IP, MAC: net.HardwareAddr(v6VxlanAttrs.VtepMAC)}); err != nil {
-							log.Error("DelV6ARP failed: ", err)
-						}
-
-						continue
-					}
-
-					// Set the route - the kernel would ARP for the Gw IP address if it hadn't already been set above so make sure
-					// this is done last.
-					if err := retry.Do(func() error {
-						return netlink.RouteReplace(&v6VxlanRoute)
-					}); err != nil {
-						log.Errorf("failed to add v6 vxlanRoute (%s -> %s): %v", v6VxlanRoute.Dst, v6VxlanRoute.Gw, err)
-
-						// Try to clean up both the ARP and FDB entries then continue
-						if err := retry.Do(func() error {
-							return nw.v6Dev.DelV6ARP(neighbor{IP6: event.Lease.IPv6Subnet.IP, MAC: net.HardwareAddr(v6VxlanAttrs.VtepMAC)})
-						}); err != nil {
-							log.Error("DelV6ARP failed: ", err)
-						}
-
-						if err := retry.Do(func() error {
-							return nw.v6Dev.DelV6FDB(neighbor{IP6: event.Lease.Attrs.PublicIPv6, MAC: net.HardwareAddr(v6VxlanAttrs.VtepMAC)})
-						}); err != nil {
-							log.Error("DelV6FDB failed: ", err)
-						}
-
-						continue
-					}
-				}
-			}
+			nw.handleLeaseAdded(event)
 		case lease.EventRemoved:
-			if event.Lease.EnableIPv4 {
-				if directRoutingOK {
-					log.V(2).Infof("Removing direct route to subnet: %s PublicIP: %s", sn, attrs.PublicIP)
-					if err := retry.Do(func() error {
-						return netlink.RouteDel(&directRoute)
-					}); err != nil {
-						log.Errorf("Error deleting route to %v via %v: %v", sn, attrs.PublicIP, err)
-					}
-				} else {
-					log.V(2).Infof("removing subnet: %s PublicIP: %s VtepMAC: %s", sn, attrs.PublicIP, net.HardwareAddr(vxlanAttrs.VtepMAC))
-
-					// Try to remove all entries - don't bail out if one of them fails.
-					if err := retry.Do(func() error {
-						return nw.dev.DelARP(neighbor{IP: sn.IP, MAC: net.HardwareAddr(vxlanAttrs.VtepMAC)})
-					}); err != nil {
-						log.Error("DelARP failed: ", err)
-					}
-
-					if err := retry.Do(func() error {
-						return nw.dev.DelFDB(neighbor{IP: attrs.PublicIP, MAC: net.HardwareAddr(vxlanAttrs.VtepMAC)})
-					}); err != nil {
-						log.Error("DelFDB failed: ", err)
-					}
-
-					if err := retry.Do(func() error {
-						return netlink.RouteDel(&vxlanRoute)
-					}); err != nil {
-						log.Errorf("failed to delete vxlanRoute (%s -> %s): %v", vxlanRoute.Dst, vxlanRoute.Gw, err)
-					}
-				}
-			}
-			if event.Lease.EnableIPv6 {
-				if v6DirectRoutingOK {
-					log.V(2).Infof("Removing v6 direct route to subnet: %s PublicIP: %s", sn, attrs.PublicIPv6)
-					if err := retry.Do(func() error {
-						return netlink.RouteDel(&v6DirectRoute)
-					}); err != nil {
-						log.Errorf("Error deleting v6 route to %v via %v: %v", v6Sn, attrs.PublicIPv6, err)
-					}
-				} else {
-					log.V(2).Infof("removing v6subnet: %s PublicIPv6: %s VtepMAC: %s", v6Sn, attrs.PublicIPv6, net.HardwareAddr(v6VxlanAttrs.VtepMAC))
-
-					// Try to remove all entries - don't bail out if one of them fails.
-					if err := retry.Do(func() error {
-						return nw.v6Dev.DelV6ARP(neighbor{IP6: v6Sn.IP, MAC: net.HardwareAddr(v6VxlanAttrs.VtepMAC)})
-					}); err != nil {
-						log.Error("DelV6ARP failed: ", err)
-					}
-
-					if err := retry.Do(func() error {
-						return nw.v6Dev.DelV6FDB(neighbor{IP6: attrs.PublicIPv6, MAC: net.HardwareAddr(v6VxlanAttrs.VtepMAC)})
-					}); err != nil {
-						log.Error("DelV6FDB failed: ", err)
-					}
-
-					if err := retry.Do(func() error {
-						return netlink.RouteDel(&v6VxlanRoute)
-					}); err != nil {
-						log.Errorf("failed to delete v6 vxlanRoute (%s -> %s): %v", v6VxlanRoute.Dst, v6VxlanRoute.Gw, err)
-					}
-				}
-			}
+			nw.handleLeaseRemoved(event)
 		default:
 			log.Error("internal error: unknown event type: ", int(event.Type))
 		}
 	}
+}
+
+// handleLeaseAdded builds one forwarding entry per enabled family and hands
+// them to the forwarding plane, which rejects conflicts, installs the kernel
+// objects transactionally and keeps the registry in sync.
+func (nw *network) handleLeaseAdded(event lease.Event) {
+	entries, err := nw.buildEntries(event)
+	if err != nil {
+		log.Error(err)
+		return
+	}
+	for _, e := range entries {
+		if err := nw.fp.addLease(e); err != nil {
+			if errors.Is(err, ErrConflictSubnet) {
+				// Requirement: refuse and log, never overwrite the live entry.
+				log.Errorf("refusing subnet lease %s: %v", e.key(), err)
+			} else {
+				log.Errorf("failed to install forwarding entry %s: %v", e.key(), err)
+			}
+		} else {
+			log.V(2).Infof("installed %s forwarding entry %s", e.kind, e.key())
+		}
+	}
+}
+
+// handleLeaseRemoved deletes the entries for both enabled families. The
+// forwarding plane makes removal idempotent and matches by IP so stale MACs
+// do not prevent deletion.
+func (nw *network) handleLeaseRemoved(event lease.Event) {
+	if event.Lease.EnableIPv4 {
+		key := "v4:" + event.Lease.Subnet.String()
+		if err := nw.fp.removeLease(key); err != nil {
+			log.Errorf("failed to remove forwarding entry %s: %v", key, err)
+		}
+	}
+	if event.Lease.EnableIPv6 {
+		key := "v6:" + event.Lease.IPv6Subnet.String()
+		if err := nw.fp.removeLease(key); err != nil {
+			log.Errorf("failed to remove forwarding entry %s: %v", key, err)
+		}
+	}
+}
+
+// buildEntries translates a lease into the concrete forwarding entries for
+// each enabled family, deciding between a VXLAN tunnel (ARP + FDB + onlink
+// route) and a direct route when the remote VTEP is on the local L2.
+func (nw *network) buildEntries(event lease.Event) ([]*forwardingEntry, error) {
+	var (
+		entries                            []*forwardingEntry
+		vxlanAttrs, v6VxlanAttrs           vxlanLeaseAttrs
+		directRoutingOK, v6DirectRoutingOK bool
+	)
+	l := event.Lease
+
+	if l.EnableIPv4 && nw.dev != nil {
+		if err := json.Unmarshal(l.Attrs.BackendData, &vxlanAttrs); err != nil {
+			return nil, fmt.Errorf("error decoding subnet lease JSON: %w", err)
+		}
+		if nw.dev.directRouting {
+			dr, err := ip.DirectRouting(l.Attrs.PublicIP.ToIP())
+			if err != nil {
+				log.Error(err)
+			} else {
+				directRoutingOK = dr
+			}
+		}
+
+		e := &forwardingEntry{
+			podSubnet: l.Subnet,
+			publicIP:  l.Attrs.PublicIP,
+			vtepMAC:   net.HardwareAddr(vxlanAttrs.VtepMAC),
+		}
+		if directRoutingOK {
+			e.kind = entryDirectRoute
+			e.gatewayIP = l.Attrs.PublicIP.ToIP()
+			log.V(2).Infof("adding direct route to subnet: %s PublicIP: %s", l.Subnet, l.Attrs.PublicIP)
+		} else {
+			e.kind = entryTunnel
+			e.gatewayIP = l.Subnet.IP.ToIP()
+			log.V(2).Infof("adding subnet: %s PublicIP: %s VtepMAC: %s", l.Subnet, l.Attrs.PublicIP, e.vtepMAC)
+		}
+		entries = append(entries, e)
+	}
+
+	if l.EnableIPv6 && nw.v6Dev != nil {
+		if err := json.Unmarshal(l.Attrs.BackendV6Data, &v6VxlanAttrs); err != nil {
+			return nil, fmt.Errorf("error decoding v6 subnet lease JSON: %w", err)
+		}
+		if l.IPv6Subnet.IP != nil {
+			if nw.v6Dev.directRouting {
+				dr, err := ip.DirectRouting(l.Attrs.PublicIPv6.ToIP())
+				if err != nil {
+					log.Error(err)
+				} else {
+					v6DirectRoutingOK = dr
+				}
+			}
+
+			e := &forwardingEntry{
+				v6:          true,
+				podSubnetV6: l.IPv6Subnet,
+				publicIPv6:  l.Attrs.PublicIPv6,
+				vtepMAC:     net.HardwareAddr(v6VxlanAttrs.VtepMAC),
+			}
+			if v6DirectRoutingOK {
+				e.kind = entryDirectRoute
+				e.gatewayIP = l.Attrs.PublicIPv6.ToIP()
+				log.V(2).Infof("adding v6 direct route to v6 subnet: %s PublicIPv6: %s", l.IPv6Subnet, l.Attrs.PublicIPv6)
+			} else {
+				e.kind = entryTunnel
+				e.gatewayIP = l.IPv6Subnet.IP.ToIP()
+				log.V(2).Infof("adding v6 subnet: %s PublicIPv6: %s VtepMAC: %s", l.IPv6Subnet, l.Attrs.PublicIPv6, e.vtepMAC)
+			}
+			entries = append(entries, e)
+		}
+	}
+
+	return entries, nil
 }

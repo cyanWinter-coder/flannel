@@ -489,6 +489,15 @@ func main() {
 	wg.Add(1)
 	go func() {
 		bn.Run(ctx)
+		// Backends that own kernel state (e.g. the VXLAN device and its
+		// ARP/FDB/route entries) implement this optional interface so their
+		// data plane is removed cleanly on shutdown. The call must be
+		// idempotent: Run's own exit path may already have torn things down.
+		if closer, ok := bn.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil {
+				log.Errorf("Error closing backend network: %v", err)
+			}
+		}
 		wg.Done()
 	}()
 

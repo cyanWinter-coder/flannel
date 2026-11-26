@@ -219,6 +219,17 @@ func createVXLANDevice(ctx context.Context,
 		dev.directRouting = cfg.DirectRouting
 	}
 
+	// rollbackCreatedDevices removes devices this call created when a later
+	// step fails, so a dual-stack setup never leaks the v4 device after the
+	// v6 device fails (or vice versa). Adopted pre-existing devices are left
+	// untouched.
+	defer func() {
+		if err == nil {
+			return
+		}
+		rollbackCreatedDevices(dev, v6Dev)
+	}()
+
 	if macStrv6 != "" {
 		hwAddrv6, err = net.ParseMAC(macStrv6)
 		if err != nil {
