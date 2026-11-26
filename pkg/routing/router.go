@@ -41,6 +41,29 @@ type Route struct {
 	GatewayAddress    net.IP
 }
 
-func (r *Route) Equal(other Route) bool {
-	return r.DestinationSubnet.IP.Equal(other.DestinationSubnet.IP) && bytes.Equal(r.DestinationSubnet.Mask, other.DestinationSubnet.Mask) && r.GatewayAddress.Equal(other.GatewayAddress)
+// Equal reports whether two routes describe the same destination and gateway.
+// Interface index is intentionally not part of this historical identity; use
+// EqualOnInterface when the interface must also match.
+func (r Route) Equal(other Route) bool {
+	return ipNetEqual(r.DestinationSubnet, other.DestinationSubnet) &&
+		ipEqual(r.GatewayAddress, other.GatewayAddress)
+}
+
+// EqualOnInterface additionally compares the route interface index.
+func (r Route) EqualOnInterface(other Route) bool {
+	return r.InterfaceIndex == other.InterfaceIndex && r.Equal(other)
+}
+
+func ipNetEqual(a, b *net.IPNet) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.IP.Equal(b.IP) && bytes.Equal(a.Mask, b.Mask)
+}
+
+func ipEqual(a, b net.IP) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Equal(b)
 }

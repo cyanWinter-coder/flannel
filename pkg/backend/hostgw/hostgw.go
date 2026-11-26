@@ -55,10 +55,11 @@ func (be *HostgwBackend) RegisterNetwork(ctx context.Context, wg *sync.WaitGroup
 		SimpleNetwork: backend.SimpleNetwork{
 			ExtIface: be.extIface,
 		},
-		SM:          be.sm,
-		BackendType: "host-gw",
-		Mtu:         be.extIface.Iface.MTU,
-		LinkIndex:   be.extIface.Iface.Index,
+		SM:           be.sm,
+		BackendType:  "host-gw",
+		Mtu:          be.extIface.Iface.MTU,
+		LinkIndex:    be.extIface.Iface.Index,
+		ManagedCIDRs: backend.ManagedCIDRsFromConfig(config),
 	}
 
 	attrs := lease.LeaseAttrs{

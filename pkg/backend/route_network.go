@@ -22,7 +22,7 @@ import (
 	"context"
 	"net"
 	"sync"
-	"time"
+	"sync/atomic"
 
 	"github.com/flannel-io/flannel/pkg/lease"
 	"github.com/flannel-io/flannel/pkg/subnet"
@@ -44,6 +44,45 @@ type RouteNetwork struct {
 	GetV6Route  func(lease *lease.Lease) *netlink.Route
 	Mtu         int
 	LinkIndex   int
+
+	// routesMu protects routes and v6Routes.
+	routesMu sync.RWMutex
+	// statusMu protects syncStatus initialization.
+	statusMu   sync.Mutex
+	syncStatus map[int]*routeSyncState
+
+	// desiredReady is set after the first lease event batch has populated the
+	// desired route cache. deletionsPaused is used during the startup grace
+	// window to add missing routes without deleting from a partial cache.
+	desiredReady    atomic.Bool
+	deletionsPaused atomic.Bool
+
+	// SyncConfig tunes periodic reconciliation. Zero fields use defaults.
+	SyncConfig RouteSyncConfig
+	// Alternate configuration field names used by tests/call sites.
+	Config          RouteSyncConfig
+	RouteSyncConfig RouteSyncConfig
+	ReconcileConfig RouteSyncConfig
+	// ManagedCIDRs optionally limits deletion to destinations inside these
+	// cluster CIDRs. When empty, only default/desired-state safety guards apply.
+	ManagedCIDRs []*net.IPNet
+}
+
+// ManagedCIDRsFromConfig returns the cluster CIDRs that are allowed to contain
+// routes deleted by reconciliation. Limiting deletions to these CIDRs prevents
+// unrelated host routes from being removed.
+func ManagedCIDRsFromConfig(config *subnet.Config) []*net.IPNet {
+	if config == nil {
+		return nil
+	}
+	cidrs := make([]*net.IPNet, 0, 2)
+	if config.EnableIPv4 && !config.Network.Empty() {
+		cidrs = append(cidrs, config.Network.ToIPNet())
+	}
+	if config.EnableIPv6 && !config.IPv6Network.Empty() {
+		cidrs = append(cidrs, config.IPv6Network.ToIPNet())
+	}
+	return cidrs
 }
 
 func (n *RouteNetwork) MTU() int {
@@ -81,6 +120,10 @@ func (n *RouteNetwork) Run(ctx context.Context) {
 }
 
 func (n *RouteNetwork) handleSubnetEvents(batch []lease.Event) {
+	// The first watch batch is the initial lease snapshot. Only after it has
+	// been applied is the desired route cache safe to use for deletions.
+	defer n.desiredReady.Store(true)
+
 	for _, evt := range batch {
 		switch evt.Type {
 		case lease.EventAdded:
@@ -113,6 +156,10 @@ func (n *RouteNetwork) handleSubnetEvents(batch []lease.Event) {
 				log.Info("Subnet removed: ", evt.Lease.Subnet)
 
 				route := n.GetRoute(&evt.Lease)
+				if isDefaultRoute(route) {
+					log.Errorf("Refusing to delete default IPv4 route while removing subnet %v", evt.Lease.Subnet)
+					continue
+				}
 				// Always remove the route from the route list.
 				n.removeFromV4RouteList(*route)
 
@@ -125,6 +172,10 @@ func (n *RouteNetwork) handleSubnetEvents(batch []lease.Event) {
 				log.Info("Subnet removed: ", evt.Lease.IPv6Subnet)
 
 				route := n.GetV6Route(&evt.Lease)
+				if isDefaultRoute(route) {
+					log.Errorf("Refusing to delete default IPv6 route while removing subnet %v", evt.Lease.IPv6Subnet)
+					continue
+				}
 				// Always remove the route from the route list.
 				n.removeFromV6RouteList(*route)
 
@@ -175,10 +226,14 @@ func routeAdd(route *netlink.Route, ipFamily int, addToRouteList, removeFromRout
 }
 
 func (n *RouteNetwork) addToRouteList(route netlink.Route) {
+	n.routesMu.Lock()
+	defer n.routesMu.Unlock()
 	n.routes = addToRouteList(&route, n.routes)
 }
 
 func (n *RouteNetwork) addToV6RouteList(route netlink.Route) {
+	n.routesMu.Lock()
+	defer n.routesMu.Unlock()
 	n.v6Routes = addToRouteList(&route, n.v6Routes)
 }
 
@@ -192,10 +247,14 @@ func addToRouteList(route *netlink.Route, routes []netlink.Route) []netlink.Rout
 }
 
 func (n *RouteNetwork) removeFromV4RouteList(route netlink.Route) {
+	n.routesMu.Lock()
+	defer n.routesMu.Unlock()
 	n.routes = n.removeFromRouteList(&route, n.routes)
 }
 
 func (n *RouteNetwork) removeFromV6RouteList(route netlink.Route) {
+	n.routesMu.Lock()
+	defer n.routesMu.Unlock()
 	n.v6Routes = n.removeFromRouteList(&route, n.v6Routes)
 }
 
@@ -210,61 +269,31 @@ func (n *RouteNetwork) removeFromRouteList(route *netlink.Route, routes []netlin
 }
 
 func (n *RouteNetwork) routeCheck(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(routeCheckRetries * time.Second):
-			n.checkSubnetExistInV4Routes()
-			n.checkSubnetExistInV6Routes()
-		}
-	}
+	n.runRouteSyncLoop(ctx)
 }
 
 func (n *RouteNetwork) checkSubnetExistInV4Routes() {
-	n.checkSubnetExistInRoutes(n.routes, netlink.FAMILY_V4)
+	n.checkSubnetExistInRoutes(n.snapshotDesiredRoutes(netlink.FAMILY_V4), netlink.FAMILY_V4)
 }
 
 func (n *RouteNetwork) checkSubnetExistInV6Routes() {
-	n.checkSubnetExistInRoutes(n.v6Routes, netlink.FAMILY_V6)
+	n.checkSubnetExistInRoutes(n.snapshotDesiredRoutes(netlink.FAMILY_V6), netlink.FAMILY_V6)
 }
 
 func (n *RouteNetwork) checkSubnetExistInRoutes(routes []netlink.Route, ipFamily int) {
-	routeList, err := netlink.RouteList(nil, ipFamily)
-	if err == nil {
-		for _, route := range routes {
-			exist := false
-			for _, r := range routeList {
-				if r.Dst == nil {
-					continue
-				}
-				if routeEqual(r, route) {
-					exist = true
-					break
-				}
-			}
-
-			if !exist {
-				if err := netlink.RouteAdd(&route); err != nil {
-					if nerr, ok := err.(net.Error); !ok {
-						log.Errorf("Error recovering route to %v: %v, %v", route.Dst, route.Gw, nerr)
-					}
-					continue
-				} else {
-					log.Infof("Route recovered %v : %v", route.Dst, route.Gw)
-				}
-			}
-		}
-	} else {
-		log.Errorf("Error fetching route list. Will automatically retry: %v", err)
-	}
+	n.ReconcileFamily(context.Background(), ipFamily, routes)
 }
 
 func routeEqual(x, y netlink.Route) bool {
 	// For ipip backend, when enabling directrouting, link index of some routes may change
-	// For both ipip and host-gw backend, link index may also change if updating ExtIface
-	if x.Dst.IP.Equal(y.Dst.IP) && x.Gw.Equal(y.Gw) && bytes.Equal(x.Dst.Mask, y.Dst.Mask) && x.LinkIndex == y.LinkIndex {
-		return true
+	// For both ipip and host-gw backend, link index may also change if updating ExtIface.
+	// Nil destinations are handled safely so a default route can never panic reconciliation.
+	return routeIPNetEqual(x.Dst, y.Dst) && x.Gw.Equal(y.Gw) && x.LinkIndex == y.LinkIndex
+}
+
+func routeIPNetEqual(x, y *net.IPNet) bool {
+	if x == nil || y == nil {
+		return x == nil && y == nil
 	}
-	return false
+	return x.IP.Equal(y.IP) && bytes.Equal(x.Mask, y.Mask)
 }

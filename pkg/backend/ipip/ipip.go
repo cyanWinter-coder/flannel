@@ -71,8 +71,9 @@ func (be *IPIPBackend) RegisterNetwork(ctx context.Context, wg *sync.WaitGroup, 
 		SimpleNetwork: backend.SimpleNetwork{
 			ExtIface: be.extIface,
 		},
-		SM:          be.sm,
-		BackendType: backendType,
+		SM:           be.sm,
+		BackendType:  backendType,
+		ManagedCIDRs: backend.ManagedCIDRsFromConfig(config),
 	}
 
 	attrs := &lease.LeaseAttrs{
