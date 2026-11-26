@@ -44,6 +44,16 @@ type IPTablesError interface {
 type IPTablesManager struct {
 	ipv4Rules []trafficmngr.IPTablesRule
 	ipv6Rules []trafficmngr.IPTablesRule
+
+	// DryRun makes reconciliation compute and log diffs without applying.
+	DryRun bool
+	// Metrics receives aggregate delivery counters when set.
+	Metrics *trafficmngr.Metrics
+	// OnReport is called after every reconcile pass with its result.
+	OnReport func(*trafficmngr.Result)
+	// VerifyAfterApply re-lists rules after a successful apply and rolls back
+	// when the desired state was not reached.
+	VerifyAfterApply bool
 }
 
 func (iptm *IPTablesManager) Init(ctx context.Context) error {
@@ -55,6 +65,9 @@ func (iptm *IPTablesManager) Init(ctx context.Context) error {
 	return nil
 }
 
+// SetDryRun toggles compare-and-report-only mode.
+func (iptm *IPTablesManager) SetDryRun(dryRun bool) { iptm.DryRun = dryRun }
+
 func (iptm *IPTablesManager) CleanUp(ctx context.Context) error {
 	log.Info("Cleaning-up iptables rules...")
 	//IPv4
@@ -63,28 +76,18 @@ func (iptm *IPTablesManager) CleanUp(ctx context.Context) error {
 		// if we can't find iptables, give up and return
 		return fmt.Errorf("failed to setup IPTables. iptables binary was not found: %v", err)
 	}
-	err = ipt.ClearAndDeleteChain("nat", "FLANNEL-POSTRTG")
-	if err != nil {
-		log.V(2).Infof("could not clean-up FLANNEL-POSTRTG (IPv4): %v", err)
-	}
-	err = ipt.ClearAndDeleteChain("nat", "FLANNEL-FWD")
-	if err != nil {
-		log.V(2).Infof("could not clean-up FLANNEL-FWD (IPv4): %v", err)
+	if err := cleanupIPTablesFamily(ipt, iptables.ProtocolIPv4); err != nil {
+		log.V(2).Infof("IPv4 cleanup returned errors (continuing): %v", err)
 	}
 
-	//IPv6
+	//IPv6: a missing ip6tables binary must not block cleanup of IPv4 rules.
 	ipt6, err := iptables.NewWithProtocol(iptables.ProtocolIPv6)
 	if err != nil {
-		// if we can't find iptables, give up and return
-		return fmt.Errorf("failed to setup IPTables. ip6tables binary was not found: %v", err)
+		log.V(2).Infof("ip6tables unavailable, skipping IPv6 cleanup: %v", err)
+		return nil
 	}
-	err = ipt6.ClearAndDeleteChain("nat", "FLANNEL-POSTRTG")
-	if err != nil {
-		log.V(2).Infof("could not clean-up FLANNEL-POSTRTG (IPv6): %v", err)
-	}
-	err = ipt6.ClearAndDeleteChain("nat", "FLANNEL-FWD")
-	if err != nil {
-		log.V(2).Infof("could not clean-up FLANNEL-FWD (IPv6): %v", err)
+	if err := cleanupIPTablesFamily(ipt6, iptables.ProtocolIPv6); err != nil {
+		log.V(2).Infof("IPv6 cleanup returned errors (continuing): %v", err)
 	}
 	return nil
 }
@@ -109,7 +112,6 @@ func (iptm *IPTablesManager) SetupAndEnsureMasqRules(ctx context.Context, flanne
 		}
 
 		log.Infof("Setting up masking rules")
-		iptm.CreateIP4Chain("nat", "FLANNEL-POSTRTG")
 		iptm.setupAndEnsureIP4Tables(ctx, iptm.masqRules(flannelIPv4Net, currentlease, ipMasqRandomFullyDisable), resyncPeriod)
 	}
 	if !flannelIPv6Net.Empty() {
@@ -126,7 +128,6 @@ func (iptm *IPTablesManager) SetupAndEnsureMasqRules(ctx context.Context, flanne
 		}
 
 		log.Infof("Setting up masking rules for IPv6")
-		iptm.CreateIP6Chain("nat", "FLANNEL-POSTRTG")
 		iptm.setupAndEnsureIP6Tables(ctx, iptm.masqIP6Rules(flannelIPv6Net, currentlease, ipMasqRandomFullyDisable), resyncPeriod)
 	}
 	return nil
@@ -210,12 +211,10 @@ func (iptm *IPTablesManager) masqIP6Rules(ccidr ip.IP6Net, lease *lease.Lease, i
 func (iptm *IPTablesManager) SetupAndEnsureForwardRules(ctx context.Context, flannelIPv4Network ip.IP4Net, flannelIPv6Network ip.IP6Net, resyncPeriod int) {
 	if !flannelIPv4Network.Empty() {
 		log.Infof("Changing default FORWARD chain policy to ACCEPT")
-		iptm.CreateIP4Chain("filter", "FLANNEL-FWD")
 		iptm.setupAndEnsureIP4Tables(ctx, iptm.forwardRules(flannelIPv4Network.String()), resyncPeriod)
 	}
 	if !flannelIPv6Network.Empty() {
 		log.Infof("IPv6: Changing default FORWARD chain policy to ACCEPT")
-		iptm.CreateIP6Chain("filter", "FLANNEL-FWD")
 		iptm.setupAndEnsureIP6Tables(ctx, iptm.forwardRules(flannelIPv6Network.String()), resyncPeriod)
 	}
 }
@@ -374,11 +373,7 @@ func (iptm *IPTablesManager) setupAndEnsureIP4Tables(ctx context.Context, rules 
 		return
 	}
 
-	err = ipTablesBootstrap(ipt, iptRestore, rules)
-	if err != nil {
-		// if we can't find iptables, give up and return
-		log.Errorf("Failed to bootstrap IPTables: %v", err)
-	}
+	iptm.reconcileRulesOnce(ctx, ipt, iptRestore, rules, trafficmngr.IPv4, iptables.ProtocolIPv4)
 
 	iptm.ipv4Rules = append(iptm.ipv4Rules, rules...)
 	go func() {
@@ -388,10 +383,9 @@ func (iptm *IPTablesManager) setupAndEnsureIP4Tables(ctx context.Context, rules 
 				//clean-up is setup in Init
 				return
 			case <-time.After(time.Duration(resyncPeriod) * time.Second):
-				// Ensure that all the iptables rules exist every 5 seconds
-				if err := ensureIPTables(ipt, iptRestore, rules); err != nil {
-					log.Errorf("Failed to ensure iptables rules: %v", err)
-				}
+				// Compare with the live ruleset and correct only the delta,
+				// including stacked duplicate entries.
+				iptm.reconcileRulesOnce(ctx, ipt, iptRestore, rules, trafficmngr.IPv4, iptables.ProtocolIPv4)
 			}
 		}
 	}()
@@ -411,11 +405,7 @@ func (iptm *IPTablesManager) setupAndEnsureIP6Tables(ctx context.Context, rules 
 		return
 	}
 
-	err = ipTablesBootstrap(ipt, iptRestore, rules)
-	if err != nil {
-		// if we can't find iptables, give up and return
-		log.Errorf("Failed to bootstrap IPTables: %v", err)
-	}
+	iptm.reconcileRulesOnce(ctx, ipt, iptRestore, rules, trafficmngr.IPv6, iptables.ProtocolIPv6)
 	iptm.ipv6Rules = append(iptm.ipv6Rules, rules...)
 
 	go func() {
@@ -425,10 +415,8 @@ func (iptm *IPTablesManager) setupAndEnsureIP6Tables(ctx context.Context, rules 
 				//clean-up is setup in Init
 				return
 			case <-time.After(time.Duration(resyncPeriod) * time.Second):
-				// Ensure that all the iptables rules exist every 5 seconds
-				if err := ensureIPTables(ipt, iptRestore, rules); err != nil {
-					log.Errorf("Failed to ensure iptables rules: %v", err)
-				}
+				// Compare with the live ruleset and correct only the delta.
+				iptm.reconcileRulesOnce(ctx, ipt, iptRestore, rules, trafficmngr.IPv6, iptables.ProtocolIPv6)
 			}
 		}
 	}()

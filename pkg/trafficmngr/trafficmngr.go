@@ -33,6 +33,12 @@ var (
 	ErrUnimplemented = errors.New("unimplemented")
 )
 
+// DryRunCapable is implemented by traffic managers that can compare the
+// desired rules with the live ruleset and report the diff without applying it.
+type DryRunCapable interface {
+	SetDryRun(bool)
+}
+
 const KubeProxyMark string = "0x4000/0x4000"
 
 type TrafficManager interface {

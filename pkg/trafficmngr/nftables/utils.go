@@ -29,6 +29,9 @@ const (
 
 // check whether masquerade fully-random is supported by the kernel
 func (nftm *NFTablesManager) checkRandomfully(ctx context.Context) bool {
+	if nftm == nil || nftm.nftv4 == nil {
+		return false
+	}
 	result := true
 	tx := nftm.nftv4.NewTransaction()
 	tx.Add(&knftables.Chain{

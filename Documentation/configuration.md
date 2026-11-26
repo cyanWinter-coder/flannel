@@ -79,6 +79,7 @@ The following configuration illustrates the use of most options with `udp` backe
 --iface-can-reach="": detect interface to use (IP or name) for inter-host communication based on which will be used for provided IP. This is exactly the interface to use of command "ip route get <ip-address>" (example: --iface-can-reach=192.168.1.1 results the interface can be reached to 192.168.1.1 will be selected)
 --iptables-forward-rules: Adds default ACCEPT rules to the iptables FORWARD chain to allow network traffic forwarding (default: true).
 --iptables-resync=5: resync period for iptables rules, in seconds. Defaults to 5 seconds, if you see a large amount of contention for the iptables lock increasing this will probably help.
+--rules-dry-run=false: compare the desired rules with the live iptables/nftables ruleset and log the diff, per-rule counters and elapsed time without applying any change. Each resync is idempotent: existing rules are compared first, stacked duplicate entries are removed in one transaction, only the delta is applied, and a failed apply is rolled back to the previous state.
 --subnet-file=/run/flannel/subnet.env: filename where env variables (subnet and MTU values) will be written to.
 --net-config-path=/etc/kube-flannel/net-conf.json: path to the network configuration file to use
 --subnet-lease-renew-margin=60: subnet lease renewal margin, in minutes.

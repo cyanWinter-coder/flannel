@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/coreos/go-iptables/iptables"
@@ -122,31 +123,31 @@ func (iptr *ipTablesRestore) runWithOutput(args []string, stdin io.Reader) (stri
 
 // buildIPTablesRestorePayload build table/COMMIT payload
 func buildIPTablesRestorePayload(tableRules IPTablesRestoreRules) string {
-	iptablesRestorePayload := ""
+	var b strings.Builder
 	for table, rules := range tableRules {
-		iptablesRestorePayload += "*" + table + "\n"
+		b.WriteString("*" + table + "\n")
 
 		for _, lineRule := range rules {
 			// as iptables-restore use stdin if "--comment" then protect "the comment"
 			size := len(lineRule)
 			for i, rule := range lineRule {
 				if i > 0 && lineRule[i-1] == "--comment" {
-					iptablesRestorePayload += "\"" + rule + "\""
+					b.WriteString("\"" + rule + "\"")
 				} else {
-					iptablesRestorePayload += rule
+					b.WriteString(rule)
 				}
 
 				if i < size-1 {
-					iptablesRestorePayload += " "
+					b.WriteByte(' ')
 				} else {
-					iptablesRestorePayload += "\n"
+					b.WriteByte('\n')
 				}
 			}
 		}
 
-		iptablesRestorePayload += "COMMIT\n"
+		b.WriteString("COMMIT\n")
 	}
-	return iptablesRestorePayload
+	return b.String()
 }
 
 // getIptablesRestoreSupport get current iptables-restore support

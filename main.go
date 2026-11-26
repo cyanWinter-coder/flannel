@@ -96,6 +96,7 @@ type CmdLineOpts struct {
 	healthzPort               int
 	iptablesResyncSeconds     int
 	iptablesForwardRules      bool
+	rulesDryRun               bool
 	blackholeRoute            bool
 	netConfPath               string
 	setNodeNetworkUnavailable bool
@@ -136,6 +137,7 @@ func init() {
 	flannelFlags.IntVar(&opts.healthzPort, "healthz-port", 0, "the port for healthz server to listen(0 to disable)")
 	flannelFlags.IntVar(&opts.iptablesResyncSeconds, "iptables-resync", 5, "resync period for iptables rules, in seconds")
 	flannelFlags.BoolVar(&opts.iptablesForwardRules, "iptables-forward-rules", true, "add default accept rules to FORWARD chain in iptables")
+	flannelFlags.BoolVar(&opts.rulesDryRun, "rules-dry-run", false, "compare traffic rules with the live ruleset and log the diff/counters without applying changes")
 	flannelFlags.BoolVar(&opts.blackholeRoute, "ip-blackhole-route", false, "add blackroute route ont the node for the local podCIDR")
 	flannelFlags.StringVar(&opts.netConfPath, "net-config-path", "/etc/kube-flannel/net-conf.json", "path to the network configuration file")
 	flannelFlags.BoolVar(&opts.setNodeNetworkUnavailable, "set-node-network-unavailable", true, "set NodeNetworkUnavailable after ready")
@@ -400,6 +402,12 @@ func main() {
 	}
 	//Create TrafficManager and instantiate it based on whether we use iptables or nftables
 	trafficMngr := newTrafficManager(config.EnableNFTables)
+	if opts.rulesDryRun {
+		if dr, ok := trafficMngr.(trafficmngr.DryRunCapable); ok {
+			dr.SetDryRun(true)
+			log.Warning("Traffic rules running in DRY-RUN mode: differences will be logged but rules will not be applied")
+		}
+	}
 	err = trafficMngr.Init(ctx)
 	if err != nil {
 		log.Error(err)
